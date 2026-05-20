@@ -116,6 +116,8 @@ class OpenAIClient:
             "- Если проект неясен, поставь project=null и добавь 'project' в missing.\n"
             "- Если срок не указан, поставь due_date=null и добавь 'due_date' в missing.\n"
             "- Если уверенность по проекту/типу/сроку ниже 0.70, добавь соответствующее поле в missing.\n"
+            "- В title задачи не включай проект, направление, срок, оценку времени и желаемый результат; title = только короткое действие.\n"
+            "- В question вопроса на изучение не включай проект, направление, срок и формат результата; question = только суть изучения.\n"
             "- Расширяй описание так, чтобы через месяц было понятно, что сделать и зачем.\n"
             "- Даты возвращай ISO YYYY-MM-DD. Сегодня: " + today + ".\n"
             "Направления: Работа, Бизнес, Личное развитие, Семья, Прочее.\n"
@@ -180,7 +182,7 @@ class OpenAIClient:
             )
             data["tasks"].append(
                 {
-                    "title": _clean_title(source, prefixes=("юба, задача:", "люба, задача:", "задача:")),
+                    "title": _clean_title(source, prefixes=("юба, задача:", "люба, задача:", "задача:"), kind="task"),
                     "description": source,
                     "desired_result": desired_result,
                     "project": project,
@@ -200,7 +202,7 @@ class OpenAIClient:
             due_date = _extract_due_date(source, today)
             data["studies"].append(
                 {
-                    "question": _clean_title(source, prefixes=("и на изучение:", "на изучение:")),
+                    "question": _clean_title(source, prefixes=("и на изучение:", "на изучение:"), kind="study"),
                     "description": source,
                     "industry": _guess_industry(source),
                     "research_type": "Глубокое" if "подроб" in source.lower() or "глубок" in source.lower() else "Простое",
@@ -279,14 +281,33 @@ def _missing(*, project: str | None, area: str | None, due_date: str | None) -> 
     return missing
 
 
-def _clean_title(text: str, *, prefixes: tuple[str, ...]) -> str:
+def _clean_title(text: str, *, prefixes: tuple[str, ...], kind: str = "generic") -> str:
     value = text.strip()
     lower = value.lower()
     for prefix in prefixes:
         if lower.startswith(prefix):
             value = value[len(prefix) :].strip()
             break
+    value = _strip_metadata_from_title(value, kind=kind)
     return _first_sentence(value)[:120]
+
+
+def _strip_metadata_from_title(text: str, *, kind: str) -> str:
+    value = text.strip()
+    metadata_patterns = [
+        r"\s+по проекту\s+[^,.]+",
+        r"\s+направлени[ея]\s+[^,.]+",
+        r"\s+оценка\s+\d+\s*(?:минут|мин|м\b|час[а-я]*)",
+        r"\s+желаемый результат\s*:\s*.+$",
+        r"\s+нужна\s+.+(?:справка|таблица|memo|дайджест).*$",
+    ]
+    for pattern in metadata_patterns:
+        value = re.sub(pattern, "", value, flags=re.IGNORECASE)
+    if kind == "task":
+        value = re.sub(r"^(?:до\s+\S+\s+)", "", value, flags=re.IGNORECASE)
+    if kind == "study":
+        value = re.sub(r"^(?:до\s+\S+\s+)", "", value, flags=re.IGNORECASE)
+    return value.strip(" .,\n\t")
 
 
 def _first_sentence(text: str) -> str:
