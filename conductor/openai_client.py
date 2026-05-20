@@ -165,7 +165,7 @@ class OpenAIClient:
 
     def _fallback(self, text: str, *, today: str | None = None, note: str = "fallback classifier") -> Classification:
         task_words = ("позвон", "напиш", "напис", "найти", "посчит", "подготов", "договор", "сдел", "отправ")
-        study_words = ("изуч", "разобраться в", "понять", "исслед", "собрать справ")
+        study_words = ("изуч", "разобраться в", "исслед", "собрать справ")
         lower = text.lower()
         data: dict[str, Any] = {"tasks": [], "studies": [], "notes": [note]}
         task_text, study_text = _split_task_and_study(text)
@@ -193,7 +193,7 @@ class OpenAIClient:
                     "missing": _missing(project=project, area=_normalize_area(area), due_date=due_date),
                 }
             )
-        if any(word in lower for word in study_words):
+        if study_text or any(word in lower for word in study_words):
             source = study_text or text
             project = _extract_after(source, r"по проекту\s+([^,.]+)")
             area = _extract_after(source, r"направлени[ея]\s+([^,.]+)")
