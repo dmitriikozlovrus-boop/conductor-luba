@@ -27,6 +27,7 @@ class ConductorService:
         self.pending = PendingStore(settings.pending_store_path)
 
     def process_text(self, text: str, *, chat_id: int | None = None, source: str = "Telegram") -> dict[str, Any]:
+        pending_item: dict[str, Any] | None = None
         if chat_id is not None:
             pending = self.pending.pop_oldest_for_chat(chat_id)
             if pending:
@@ -43,6 +44,8 @@ class ConductorService:
             if chat_id is not None:
                 self.telegram.send_message(chat_id, f"Не смог разобрать сообщение через AI: {exc}")
             return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
+        if pending_item:
+            classification = _apply_clarification_fallbacks(classification)
         return self._handle_classification(classification, chat_id=chat_id, source=source)
 
     def process_audio(
@@ -54,7 +57,15 @@ class ConductorService:
         chat_id: int | None = None,
         source: str = "Telegram voice",
     ) -> dict[str, Any]:
-        text = self.openai.transcribe(filename, data, content_type)
+        try:
+            text = self.openai.transcribe(filename, data, content_type)
+        except Exception as exc:  # noqa: BLE001 - voice failures should be visible to the user.
+            if chat_id is not None:
+                self.telegram.send_message(
+                    chat_id,
+                    f"Не смогла расшифровать голосовое: {exc}. Пока можно прислать текстом, а я продолжу разбор.",
+                )
+            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
         result = self.process_text(text, chat_id=chat_id, source=source)
         result["transcript"] = text
         return result
@@ -95,6 +106,8 @@ class ConductorService:
 
         if chat_id is not None and errors:
             self.telegram.send_message(chat_id, "\n".join(errors))
+        if chat_id is not None and (created_tasks or created_studies):
+            self.telegram.send_message(chat_id, _format_created_summary(classification))
         return {
             "tasks_created": created_tasks,
             "studies_created": created_studies,
@@ -125,12 +138,56 @@ class ConductorService:
             questions.append("Какой срок/горизонт изучения?")
         if "area" in item.missing or not item.area:
             questions.append("Какое направление: Работа, Бизнес, Личное развитие, Семья или Прочее?")
+        if _needs_study_questions(item):
+            questions.append("Какие именно вопросы должны войти в исследование?")
         return questions
 
 
 def _format_questions(title: str, questions: list[str]) -> str:
     joined = "\n".join(f"- {q}" for q in questions)
     return f"Нужно уточнение по записи:\n{title}\n\n{joined}\n\nОтветь одним сообщением, я сохраню это как уточнение для следующего шага."
+
+
+def _format_created_summary(classification: Classification) -> str:
+    lines: list[str] = []
+    for item in classification.tasks:
+        due = item.due_date or "без срока"
+        effort = f"{item.effort_minutes} мин" if item.effort_minutes else "без оценки"
+        lines.append(f"Добавила задачу: {item.title} ({due}, {effort})")
+    for item in classification.studies:
+        lines.append(
+            f"Добавила на изучение: {item.question} ({item.research_type.lower()}, {item.result_format.lower()})"
+        )
+    lines.append("Если что-то не так, напиши одним сообщением, что изменить.")
+    return "\n".join(lines)
+
+
+def _apply_clarification_fallbacks(classification: Classification) -> Classification:
+    for item in classification.tasks:
+        if not item.project:
+            item.project = "Общее"
+        if "project" in item.missing:
+            item.missing = [value for value in item.missing if value != "project"]
+        if not item.area:
+            item.area = "Прочее"
+        if "area" in item.missing:
+            item.missing = [value for value in item.missing if value != "area"]
+    for item in classification.studies:
+        if not item.project:
+            item.project = "Общее"
+        if "project" in item.missing:
+            item.missing = [value for value in item.missing if value != "project"]
+        if not item.area:
+            item.area = "Прочее"
+        if "area" in item.missing:
+            item.missing = [value for value in item.missing if value != "area"]
+    return classification
+
+
+def _needs_study_questions(item: StudyItem) -> bool:
+    description = item.description.lower()
+    scope_markers = ("какие", "что", "сравн", "риск", "стоим", "марж", "услов", "этап", "срок", "вопрос")
+    return not any(marker in description for marker in scope_markers)
 
 
 def _merge_pending_text(pending_item: dict[str, Any], answer: str) -> str:

@@ -118,7 +118,13 @@ class OpenAIClient:
             "- Если уверенность по проекту/типу/сроку ниже 0.70, добавь соответствующее поле в missing.\n"
             "- В title задачи не включай проект, направление, срок, оценку времени и желаемый результат; title = только короткое действие.\n"
             "- Title задачи всегда начинай с большой буквы.\n"
-            "- В question вопроса на изучение не включай проект, направление, срок и формат результата; question = только суть изучения.\n"
+            "- В question вопроса на изучение не включай проект, направление, срок и формат результата; question = только что именно изучаем.\n"
+            "- Question вопроса на изучение начинай с большой буквы и по возможности убирай стартовые глаголы вроде 'изучить', 'исследовать', 'разобрать'.\n"
+            "- По умолчанию research_type = 'Простое'. Только если пользователь явно просит глубокое/подробное исследование, ставь 'Глубокое'.\n"
+            "- По умолчанию result_format = 'Краткая справка'. Если research_type = 'Глубокое', то result_format = 'Подробная справка'.\n"
+            "- desired_result формулируй как завершенный артефакт или завершенное действие: 'Подготовленная справка', 'Совершенный звонок', 'Отправленное письмо'.\n"
+            "- effort_minutes оценивай консервативно, как среднюю трудозатратность специалиста уровня 4 из 10.\n"
+            "- industry определи коротким названием отрасли.\n"
             "- Расширяй описание так, чтобы через месяц было понятно, что сделать и зачем.\n"
             "- Даты возвращай ISO YYYY-MM-DD. Сегодня: " + today + ".\n"
             "Направления: Работа, Бизнес, Личное развитие, Семья, Прочее.\n"
@@ -177,10 +183,8 @@ class OpenAIClient:
             project = _extract_after(source, r"по проекту\s+([^,.]+)")
             area = _extract_after(source, r"направлени[ея]\s+([^,.]+)")
             due_date = _extract_due_date(source, today)
-            effort_minutes = _extract_minutes(source) or 30
-            desired_result = _extract_after(source, r"Желаемый результат:\s*([^.\n]+)") or (
-                "Понятный выполненный результат по исходному сообщению."
-            )
+            effort_minutes = _extract_minutes(source) or _infer_effort_minutes(source)
+            desired_result = _extract_after(source, r"Желаемый результат:\s*([^.\n]+)") or _infer_desired_result(source)
             data["tasks"].append(
                 {
                     "title": _clean_title(source, prefixes=("юба, задача:", "люба, задача:", "задача:"), kind="task"),
@@ -201,16 +205,17 @@ class OpenAIClient:
             project = _extract_after(source, r"по проекту\s+([^,.]+)")
             area = _extract_after(source, r"направлени[ея]\s+([^,.]+)")
             due_date = _extract_due_date(source, today)
+            research_type = "Глубокое" if _wants_deep_research(source) else "Простое"
             data["studies"].append(
                 {
                     "question": _clean_title(source, prefixes=("и на изучение:", "на изучение:"), kind="study"),
                     "description": source,
                     "industry": _guess_industry(source),
-                    "research_type": "Глубокое" if "подроб" in source.lower() or "глубок" in source.lower() else "Простое",
+                    "research_type": research_type,
                     "project": project,
                     "area": _normalize_area(area),
                     "priority": "P2",
-                    "result_format": "Подробная справка" if "подроб" in source.lower() else "Краткая справка",
+                    "result_format": "Подробная справка" if research_type == "Глубокое" else "Краткая справка",
                     "due_date": due_date,
                     "source": "Telegram",
                     "confidence": 0.75 if project and due_date else 0.45,
@@ -308,6 +313,7 @@ def _strip_metadata_from_title(text: str, *, kind: str) -> str:
         value = re.sub(r"^(?:до\s+\S+\s+)", "", value, flags=re.IGNORECASE)
     if kind == "study":
         value = re.sub(r"^(?:до\s+\S+\s+)", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"^(?:изучить|исследовать|разобрать|разобраться в|понять)\s+", "", value, flags=re.IGNORECASE)
     return value.strip(" .,\n\t")
 
 
@@ -331,6 +337,37 @@ def _guess_industry(text: str) -> str:
     if "ai" in lower or "ии" in lower:
         return "AI"
     return "Не определено"
+
+
+def _infer_effort_minutes(text: str) -> int:
+    lower = text.lower()
+    if any(word in lower for word in ("позвон", "напис", "ответ", "отправ")):
+        return 15
+    if any(word in lower for word in ("подготов", "собрать", "соглас", "сравн")):
+        return 30
+    if any(word in lower for word in ("переговор", "рассчитать", "разобраться", "проработ")):
+        return 60
+    return 30
+
+
+def _infer_desired_result(text: str) -> str:
+    lower = text.lower()
+    if "позвон" in lower:
+        return "Совершенный звонок"
+    if "напис" in lower or "отправ" in lower:
+        return "Отправленное письмо"
+    if "подготов" in lower and "справ" in lower:
+        return "Подготовленная справка"
+    if "подготов" in lower:
+        return "Подготовленный материал"
+    if "собрать" in lower:
+        return "Собранная информация"
+    return "Выполненная задача"
+
+
+def _wants_deep_research(text: str) -> bool:
+    lower = text.lower()
+    return any(marker in lower for marker in ("глубок", "подроб", "детальн", "развернут"))
 
 
 def _extract_response_text(data: dict[str, Any]) -> str:

@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import Mock
 
 from conductor.models import classification_from_dict, normalize_effort
 from conductor.openai_client import OpenAIClient
+from conductor.service import ConductorService, _apply_clarification_fallbacks
 
 
 class ModelsTest(unittest.TestCase):
@@ -47,6 +49,7 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result.tasks[0].project, "Сырьевой трейдинг")
         self.assertEqual(result.tasks[0].area, "Бизнес")
         self.assertEqual(result.tasks[0].due_date, "2026-05-21")
+        self.assertEqual(result.tasks[0].desired_result, "понять следующий шаг")
 
     def test_fallback_study_question_omits_metadata(self):
         client = OpenAIClient("", "unused", "unused")
@@ -55,8 +58,60 @@ class ModelsTest(unittest.TestCase):
             "по проекту Базовые масла, направление Бизнес. Нужна подробная справка.",
             today="2026-05-20",
         )
-        self.assertEqual(result.studies[0].question, "Изучить доступные логистические пути через Веракрус")
+        self.assertEqual(result.studies[0].question, "Доступные логистические пути через Веракрус")
         self.assertEqual(result.studies[0].project, "Базовые масла")
+        self.assertEqual(result.studies[0].research_type, "Глубокое")
+        self.assertEqual(result.studies[0].result_format, "Подробная справка")
+
+    def test_fallback_study_defaults_to_simple(self):
+        client = OpenAIClient("", "unused", "unused")
+        result = client._fallback(
+            "Люба, на изучение: до пятницы исследовать рынок пластификаторов по проекту Сырьевой трейдинг, направление Бизнес.",
+            today="2026-05-20",
+        )
+        self.assertEqual(result.studies[0].research_type, "Простое")
+        self.assertEqual(result.studies[0].result_format, "Краткая справка")
+
+    def test_clarification_fallback_uses_obshchee_project(self):
+        classification = classification_from_dict(
+            {
+                "tasks": [
+                    {
+                        "title": "Позвонить",
+                        "description": "Позвонить клиенту",
+                        "desired_result": "Совершенный звонок",
+                        "project": None,
+                        "area": None,
+                        "due_date": "2026-05-21",
+                        "effort_minutes": 15,
+                        "priority": "P2",
+                        "next_step": "Позвонить клиенту",
+                        "confidence": 0.6,
+                        "missing": ["project", "area"],
+                    }
+                ],
+                "studies": [],
+                "notes": [],
+            }
+        )
+        result = _apply_clarification_fallbacks(classification)
+        self.assertEqual(result.tasks[0].project, "Общее")
+        self.assertEqual(result.tasks[0].area, "Прочее")
+        self.assertEqual(result.tasks[0].missing, [])
+
+    def test_process_audio_reports_transcription_failure(self):
+        service = object.__new__(ConductorService)
+        service.openai = Mock()
+        service.openai.transcribe.side_effect = RuntimeError("insufficient_quota")
+        service.telegram = Mock()
+
+        result = service.process_audio("voice.ogg", b"123", content_type="audio/ogg", chat_id=42)
+
+        self.assertEqual(result["tasks_created"], [])
+        self.assertEqual(result["studies_created"], [])
+        self.assertIn("insufficient_quota", result["errors"][0])
+        service.telegram.send_message.assert_called_once()
+        self.assertIn("Не смогла расшифровать голосовое", service.telegram.send_message.call_args.args[1])
 
 
 if __name__ == "__main__":
