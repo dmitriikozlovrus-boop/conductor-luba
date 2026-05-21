@@ -6,7 +6,7 @@ from typing import Any
 from .config import Settings
 from .models import Classification, StudyItem, TaskItem
 from .notion_client import NotionClient
-from .openai_client import OpenAIClient
+from .openai_client import OpenAIClient, _extract_due_date, _normalize_area
 from .pending import PendingStore
 from .telegram import TelegramClient
 from .todoist_client import TodoistClient
@@ -15,7 +15,12 @@ from .todoist_client import TodoistClient
 class ConductorService:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.openai = OpenAIClient(settings.openai_api_key, settings.openai_model, settings.openai_transcribe_model)
+        self.openai = OpenAIClient(
+            settings.openai_api_key,
+            settings.openai_model,
+            settings.openai_transcribe_model,
+            settings.openai_transcribe_fallback_model,
+        )
         self.notion = NotionClient(
             settings.notion_token,
             settings.notion_tasks_database_id,
@@ -32,12 +37,21 @@ class ConductorService:
             pending = self.pending.pop_oldest_for_chat(chat_id)
             if pending:
                 _, pending_item = pending
-                text = _merge_pending_text(pending_item, text)
         try:
             projects = self.notion.list_projects()
         except Exception as exc:  # noqa: BLE001 - missing project context should not break capture.
             projects = []
             print(f"Could not load Notion projects: {exc}", flush=True)
+        if pending_item:
+            resolved = _resolve_pending_without_ai(pending_item, text, today=date.today().isoformat(), projects=projects)
+            if resolved:
+                return self._handle_classification(
+                    resolved,
+                    chat_id=chat_id,
+                    source=source,
+                    from_clarification=True,
+                )
+            text = _merge_pending_text(pending_item, text)
         try:
             classification = self.openai.classify(text, projects=projects, today=date.today().isoformat())
         except Exception as exc:  # noqa: BLE001 - notify the user instead of returning a webhook 502.
@@ -46,7 +60,12 @@ class ConductorService:
             return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
         if pending_item:
             classification = _apply_clarification_fallbacks(classification)
-        return self._handle_classification(classification, chat_id=chat_id, source=source)
+        return self._handle_classification(
+            classification,
+            chat_id=chat_id,
+            source=source,
+            from_clarification=bool(pending_item),
+        )
 
     def process_audio(
         self,
@@ -57,6 +76,8 @@ class ConductorService:
         chat_id: int | None = None,
         source: str = "Telegram voice",
     ) -> dict[str, Any]:
+        if chat_id is not None:
+            self.telegram.send_message(chat_id, "Приняла голосовое. Расшифровываю и раскладываю по базам.")
         try:
             text = self.openai.transcribe(filename, data, content_type)
         except Exception as exc:  # noqa: BLE001 - voice failures should be visible to the user.
@@ -71,7 +92,12 @@ class ConductorService:
         return result
 
     def _handle_classification(
-        self, classification: Classification, *, chat_id: int | None, source: str
+        self,
+        classification: Classification,
+        *,
+        chat_id: int | None,
+        source: str,
+        from_clarification: bool = False,
     ) -> dict[str, Any]:
         created_tasks: list[str] = []
         created_studies: list[str] = []
@@ -107,7 +133,7 @@ class ConductorService:
         if chat_id is not None and errors:
             self.telegram.send_message(chat_id, "\n".join(errors))
         if chat_id is not None and (created_tasks or created_studies):
-            self.telegram.send_message(chat_id, _format_created_summary(classification))
+            self.telegram.send_message(chat_id, _format_created_summary(classification, from_clarification=from_clarification))
         return {
             "tasks_created": created_tasks,
             "studies_created": created_studies,
@@ -148,8 +174,10 @@ def _format_questions(title: str, questions: list[str]) -> str:
     return f"Нужно уточнение по записи:\n{title}\n\n{joined}\n\nОтветь одним сообщением, я сохраню это как уточнение для следующего шага."
 
 
-def _format_created_summary(classification: Classification) -> str:
+def _format_created_summary(classification: Classification, *, from_clarification: bool = False) -> str:
     lines: list[str] = []
+    if from_clarification:
+        lines.append("Зафиксировала после уточнения:")
     for item in classification.tasks:
         due = item.due_date or "без срока"
         effort = f"{item.effort_minutes} мин" if item.effort_minutes else "без оценки"
@@ -202,3 +230,72 @@ def _merge_pending_text(pending_item: dict[str, Any], answer: str) -> str:
         f"Ответ пользователя: {answer}\n"
         "Собери финальную запись. Если теперь данных хватает, confidence должен быть >= 0.70 и missing пустой."
     )
+
+
+def _resolve_pending_without_ai(
+    pending_item: dict[str, Any],
+    answer: str,
+    *,
+    today: str,
+    projects: list[dict[str, str]],
+) -> Classification | None:
+    payload = pending_item.get("payload", {})
+    item_type = payload.get("type")
+    raw_item = payload.get("item", {})
+    if item_type not in {"task", "study"} or not raw_item:
+        return None
+
+    item = dict(raw_item)
+    project_name = _extract_project_from_answer(answer, projects)
+    if project_name:
+        item["project"] = project_name
+
+    area = _extract_area_from_answer(answer)
+    if area:
+        item["area"] = area
+
+    due_date = _extract_due_date(answer, today)
+    if due_date:
+        item["due_date"] = due_date
+
+    if item_type == "study" and "Какие именно вопросы должны войти в исследование?" in "\n".join(
+        pending_item.get("questions", [])
+    ):
+        item["description"] = f"{item.get('description', '').strip()}\n\nУточнение пользователя: {answer.strip()}".strip()
+
+    missing = list(item.get("missing", []))
+    if item.get("project"):
+        missing = [value for value in missing if value != "project"]
+    if item.get("area"):
+        missing = [value for value in missing if value != "area"]
+    if item.get("due_date"):
+        missing = [value for value in missing if value != "due_date"]
+    item["missing"] = missing
+
+    if missing:
+        return None
+
+    item["confidence"] = max(float(item.get("confidence") or 0.0), 0.85)
+    if item_type == "task":
+        return Classification(tasks=[TaskItem(**item)], studies=[], notes=["resolved pending clarification"])
+    return Classification(tasks=[], studies=[StudyItem(**item)], notes=["resolved pending clarification"])
+
+
+def _extract_project_from_answer(answer: str, projects: list[dict[str, str]]) -> str | None:
+    answer_lower = answer.casefold()
+    for project in projects:
+        name = str(project.get("name") or "").strip()
+        if name and name.casefold() in answer_lower:
+            return name
+    return None
+
+
+def _extract_area_from_answer(answer: str) -> str | None:
+    answer_lower = answer.casefold()
+    for area in ("Работа", "Бизнес", "Личное развитие", "Семья", "Прочее"):
+        if area.casefold() in answer_lower:
+            return area
+    if answer_lower.strip() == "личное":
+        return "Личное развитие"
+    normalized = _normalize_area(answer.strip())
+    return normalized if normalized in {"Работа", "Бизнес", "Личное развитие", "Семья", "Прочее"} else None

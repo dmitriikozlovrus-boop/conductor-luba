@@ -1,9 +1,9 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from conductor.models import classification_from_dict, normalize_effort
 from conductor.openai_client import OpenAIClient
-from conductor.service import ConductorService, _apply_clarification_fallbacks
+from conductor.service import ConductorService, _apply_clarification_fallbacks, _resolve_pending_without_ai
 
 
 class ModelsTest(unittest.TestCase):
@@ -132,8 +132,47 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result["tasks_created"], [])
         self.assertEqual(result["studies_created"], [])
         self.assertIn("insufficient_quota", result["errors"][0])
-        service.telegram.send_message.assert_called_once()
+        self.assertEqual(service.telegram.send_message.call_count, 2)
         self.assertIn("Не смогла расшифровать голосовое", service.telegram.send_message.call_args.args[1])
+
+    def test_transcribe_uses_fallback_model(self):
+        client = OpenAIClient("key", "unused", "gpt-4o-mini-transcribe", "whisper-1")
+        with patch("conductor.openai_client.request_multipart") as request_multipart:
+            request_multipart.side_effect = [RuntimeError("primary failed"), {"text": "транскрипт"}]
+            result = client.transcribe("voice.ogg", b"123", "audio/ogg")
+        self.assertEqual(result, "транскрипт")
+        self.assertEqual(request_multipart.call_count, 2)
+
+    def test_pending_task_can_resolve_without_ai(self):
+        pending_item = {
+            "payload": {
+                "type": "task",
+                "item": {
+                    "title": "Написать Марко",
+                    "description": "Написать Марко по алюминию",
+                    "desired_result": "Отправленное письмо",
+                    "project": "СЫРЬЕВОЙ ТРЕЙДИНГ",
+                    "area": "Бизнес",
+                    "due_date": None,
+                    "effort_minutes": 15,
+                    "priority": "P2",
+                    "next_step": "Написать Марко",
+                    "confidence": 0.6,
+                    "missing": ["due_date"],
+                },
+            },
+            "questions": ["Какой срок исполнения?"],
+        }
+        result = _resolve_pending_without_ai(
+            pending_item,
+            "Завтра",
+            today="2026-05-20",
+            projects=[{"name": "СЫРЬЕВОЙ ТРЕЙДИНГ", "area": "Бизнес"}],
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.tasks[0].due_date, "2026-05-21")
+        self.assertEqual(result.tasks[0].missing, [])
+        self.assertGreaterEqual(result.tasks[0].confidence, 0.85)
 
 
 if __name__ == "__main__":

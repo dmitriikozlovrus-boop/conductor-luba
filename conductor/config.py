@@ -33,6 +33,7 @@ class Settings:
     openai_api_key: str
     openai_model: str
     openai_transcribe_model: str
+    openai_transcribe_fallback_model: str
     notion_token: str
     notion_tasks_database_id: str
     notion_study_database_id: str
@@ -54,6 +55,7 @@ def get_settings() -> Settings:
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         openai_transcribe_model=os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"),
+        openai_transcribe_fallback_model=os.getenv("OPENAI_TRANSCRIBE_FALLBACK_MODEL", "whisper-1"),
         notion_token=os.getenv("NOTION_TOKEN", ""),
         notion_tasks_database_id=os.getenv("NOTION_TASKS_DATABASE_ID", ""),
         notion_study_database_id=os.getenv("NOTION_STUDY_DATABASE_ID", ""),

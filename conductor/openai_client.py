@@ -91,10 +91,11 @@ CLASSIFIER_SCHEMA: dict[str, Any] = {
 
 
 class OpenAIClient:
-    def __init__(self, api_key: str, model: str, transcribe_model: str):
+    def __init__(self, api_key: str, model: str, transcribe_model: str, transcribe_fallback_model: str | None = None):
         self.api_key = api_key
         self.model = model
         self.transcribe_model = transcribe_model
+        self.transcribe_fallback_model = transcribe_fallback_model
 
     @property
     def headers(self) -> dict[str, str]:
@@ -169,14 +170,29 @@ class OpenAIClient:
     def transcribe(self, filename: str, data: bytes, content_type: str = "audio/ogg") -> str:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for voice transcription")
-        response = request_multipart(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers=self.headers,
-            fields={"model": self.transcribe_model, "response_format": "json", "language": "ru"},
-            files={"file": (filename, data, content_type)},
-            timeout=120,
-        )
-        return str(response.get("text") or "").strip()
+        errors: list[str] = []
+        for model in self._transcription_models():
+            try:
+                response = request_multipart(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers=self.headers,
+                    fields={"model": model, "response_format": "json", "language": "ru"},
+                    files={"file": (filename, data, content_type)},
+                    timeout=120,
+                )
+                text = str(response.get("text") or "").strip()
+                if text:
+                    return text
+                errors.append(f"{model}: empty transcript")
+            except Exception as exc:  # noqa: BLE001 - we want to try the backup model before failing.
+                errors.append(f"{model}: {exc}")
+        raise RuntimeError(" ; ".join(errors) if errors else "voice transcription failed")
+
+    def _transcription_models(self) -> list[str]:
+        models = [self.transcribe_model]
+        if self.transcribe_fallback_model and self.transcribe_fallback_model not in models:
+            models.append(self.transcribe_fallback_model)
+        return models
 
     def _fallback(
         self,
