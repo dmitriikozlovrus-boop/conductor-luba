@@ -83,13 +83,9 @@ class TaskSyncService:
             projects = self._list_notion_projects()
             result.labels_created = self._ensure_todoist_project_labels(projects)
             active_tasks = self.todoist.list_tasks()
-            completed_since = self.completed_since
-            if state.get("__meta__", {}).get("completed_backfill_finished"):
-                completed_since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-            completed_backfill_finished = False
+            completed_since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
             try:
                 completed_tasks = self.todoist.list_completed_tasks(completed_since)
-                completed_backfill_finished = True
             except Exception as exc:  # noqa: BLE001
                 completed_tasks = []
                 result.errors.append(f"Could not load completed Todoist tasks: {exc}")
@@ -114,8 +110,6 @@ class TaskSyncService:
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(f"Todoist {todoist_id}: {exc}")
             state["__meta__"] = {
-                "completed_backfill_finished": completed_backfill_finished
-                or state.get("__meta__", {}).get("completed_backfill_finished", False),
                 "last_successful_sync": datetime.now(timezone.utc).isoformat(),
             }
             self._save_state(state)
