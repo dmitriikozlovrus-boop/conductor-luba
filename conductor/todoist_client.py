@@ -104,6 +104,38 @@ class TodoistClient:
         if status != "ok":
             raise RuntimeError(f"Todoist could not move task {task_id}: {status}")
 
+    def update_task_routing_batch(self, changes: list[dict[str, Any]]) -> None:
+        commands: list[dict[str, Any]] = []
+        for change in changes:
+            task_id = str(change["id"])
+            labels_uuid = str(uuid4())
+            commands.append(
+                {
+                    "type": "item_update",
+                    "uuid": labels_uuid,
+                    "args": {"id": task_id, "labels": change.get("labels") or []},
+                }
+            )
+            move_uuid = str(uuid4())
+            move_args: dict[str, Any] = {"id": task_id}
+            if change.get("section_id"):
+                move_args["section_id"] = change["section_id"]
+            else:
+                move_args["project_id"] = change["project_id"]
+            commands.append({"type": "item_move", "uuid": move_uuid, "args": move_args})
+        for start in range(0, len(commands), 100):
+            batch = commands[start : start + 100]
+            response = request_json(
+                "POST",
+                f"{API_BASE}/sync",
+                headers=self.headers,
+                payload={"commands": batch},
+            )
+            statuses = response.get("sync_status") or {}
+            failures = {command["uuid"]: statuses.get(command["uuid"]) for command in batch if statuses.get(command["uuid"]) != "ok"}
+            if failures:
+                raise RuntimeError(f"Todoist could not update task routing: {failures}")
+
     def list_completed_tasks(self, since: str) -> list[dict[str, Any]]:
         if not self.enabled:
             return []

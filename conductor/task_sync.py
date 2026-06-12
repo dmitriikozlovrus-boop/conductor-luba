@@ -101,6 +101,8 @@ class TaskSyncService:
             self._link_existing_matches(notion_tasks, todoist_tasks, linked_ids)
             self._enrich_missing_notion_routing(notion_tasks, todoist_tasks, projects, streams)
             self._attach_notion_routing(notion_tasks, projects, streams, inbox_project_id, sections)
+            if not any(key != "__meta__" for key in state):
+                self._rebuild_todoist_routing(notion_tasks, todoist_tasks)
 
             for notion_task in notion_tasks:
                 try:
@@ -271,7 +273,7 @@ class TaskSyncService:
             # Notion is the information core. After a fresh deployment, rebuild
             # Todoist from Notion instead of treating missing sync history as a
             # user edit made in Todoist.
-            notion_changed = True
+            notion_changed = not _todoist_content_matches_notion(todoist_task, notion_task)
             todoist_changed = False
 
         if todoist_changed and not notion_changed:
@@ -320,6 +322,31 @@ class TaskSyncService:
             )
             todoist_task["project_id"] = notion_task["inbox_project_id"]
             todoist_task["section_id"] = expected_section
+
+    def _rebuild_todoist_routing(
+        self,
+        notion_tasks: list[dict[str, Any]],
+        todoist_tasks: dict[str, dict[str, Any]],
+    ) -> None:
+        changes: list[dict[str, Any]] = []
+        for notion_task in notion_tasks:
+            todoist_task = todoist_tasks.get(notion_task.get("todoist_id", ""))
+            if not todoist_task or todoist_task.get("is_completed"):
+                continue
+            labels = [notion_task["project_name"]] if notion_task.get("project_name") else []
+            changes.append(
+                {
+                    "id": notion_task["todoist_id"],
+                    "labels": labels,
+                    "project_id": notion_task["inbox_project_id"],
+                    "section_id": notion_task.get("section_id"),
+                }
+            )
+            todoist_task["labels"] = labels
+            todoist_task["project_id"] = notion_task["inbox_project_id"]
+            todoist_task["section_id"] = notion_task.get("section_id")
+        if changes:
+            self.todoist.update_task_routing_batch(changes)
 
     def _list_notion_tasks(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -704,6 +731,18 @@ def _parse_time(value: str | None) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _todoist_content_matches_notion(todoist_task: dict[str, Any], notion_task: dict[str, Any]) -> bool:
+    due = todoist_task.get("due") or {}
+    deadline = todoist_task.get("deadline") or {}
+    return (
+        str(todoist_task.get("content") or "") == str(notion_task.get("title") or "")
+        and str(todoist_task.get("description") or "") == str(notion_task.get("description") or "")
+        and todoist_priority(todoist_task.get("priority")) == notion_task.get("priority")
+        and due.get("date") == notion_task.get("due_date")
+        and deadline.get("date") == notion_task.get("deadline")
+    )
 
 
 def _fingerprint(value: dict[str, Any]) -> str:
