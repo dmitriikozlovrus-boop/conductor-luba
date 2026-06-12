@@ -11,6 +11,7 @@ from conductor.task_sync import (
     _match_key_notion,
     _match_key_todoist,
     _notion_properties_from_todoist,
+    _notion_routing_from_todoist,
     _parse_time,
     _priority_to_strategic,
     _strategic_to_priority,
@@ -84,6 +85,26 @@ class TodoistMappingTest(unittest.TestCase):
         self.assertIn("Срок выполнения", properties)
         self.assertIn("Deadline", properties)
         self.assertNotIn("Проект", properties)
+
+    def test_todoist_section_and_label_become_notion_routing(self):
+        properties = _notion_routing_from_todoist(
+            {"labels": ["Project A"], "section_id": "section-work"},
+            {"project a": {"id": "project-1", "name": "Project A"}},
+            {"работа": {"id": "stream-work", "name": "РАБОТА"}},
+            {"работа": "section-work", "прочее": "section-other"},
+        )
+        self.assertEqual(properties["Проект"], {"relation": [{"id": "project-1"}]})
+        self.assertEqual(properties["Stream"], {"relation": [{"id": "stream-work"}]})
+
+    def test_todoist_other_section_and_no_label_clear_notion_routing(self):
+        properties = _notion_routing_from_todoist(
+            {"labels": [], "section_id": "section-other"},
+            {"project a": {"id": "project-1", "name": "Project A"}},
+            {"работа": {"id": "stream-work", "name": "РАБОТА"}},
+            {"работа": "section-work", "прочее": "section-other"},
+        )
+        self.assertEqual(properties["Проект"], {"relation": []})
+        self.assertEqual(properties["Stream"], {"relation": []})
 
     def test_existing_tasks_match_by_normalized_title_and_due_date(self):
         notion = {"title": "  Подготовить   письмо ", "due_date": "2026-06-13"}
@@ -166,7 +187,7 @@ class TaskSyncTest(unittest.TestCase):
             todo = {"id": "todo-1", "content": "Task", "priority": 2, "is_completed": True}
             result = SyncResult(errors=[])
             service._sync_notion_task(notion, {"todo-1": todo}, {}, result)
-            service._update_notion_from_todoist.assert_called_once_with("page-1", todo)
+            service._update_notion_from_todoist.assert_called_once_with("page-1", todo, {}, {}, {})
             todoist.reopen_task.assert_not_called()
             self.assertEqual(result.todoist_to_notion, 1)
 
@@ -237,8 +258,12 @@ class TaskSyncTest(unittest.TestCase):
             self.assertEqual(inbox_id, "inbox-1")
             self.assertEqual(sections["работа"], "section-1")
             self.assertEqual(sections["бизнес"], "section-2")
-            todoist.create_section.assert_called_once_with("БИЗНЕС", "inbox-1")
-            self.assertEqual(created, 1)
+            self.assertIn("прочее", sections)
+            self.assertEqual(
+                todoist.create_section.call_args_list,
+                [unittest.mock.call("БИЗНЕС", "inbox-1"), unittest.mock.call("ПРОЧЕЕ", "inbox-1")],
+            )
+            self.assertEqual(created, 2)
 
     def test_task_stream_overrides_project_stream_for_inbox_section(self):
         tasks = [{"project_id": "project-1", "stream_id": "stream-family"}]
@@ -255,17 +280,17 @@ class TaskSyncTest(unittest.TestCase):
         self.assertEqual(tasks[0]["stream_name"], "СЕМЬЯ")
         self.assertEqual(tasks[0]["section_id"], "section-family")
 
-    def test_project_stream_is_used_when_task_stream_is_empty(self):
+    def test_empty_task_stream_routes_to_other_even_when_project_has_stream(self):
         tasks = [{"project_id": "project-1", "stream_id": None}]
         TaskSyncService._attach_notion_routing(
             tasks,
             {"project": {"id": "project-1", "name": "Project", "stream_id": "stream-work"}},
             {"работа": {"id": "stream-work", "name": "РАБОТА"}},
             "inbox-1",
-            {"работа": "section-work"},
+            {"работа": "section-work", "прочее": "section-other"},
         )
-        self.assertEqual(tasks[0]["stream_name"], "РАБОТА")
-        self.assertEqual(tasks[0]["section_id"], "section-work")
+        self.assertEqual(tasks[0]["stream_name"], "")
+        self.assertEqual(tasks[0]["section_id"], "section-other")
 
     def test_empty_notion_routing_is_initialized_from_matching_todoist_labels(self):
         todoist = Mock(spec=TodoistClient)
@@ -288,7 +313,7 @@ class TaskSyncTest(unittest.TestCase):
                 self.assertEqual(properties["Проект"], {"relation": [{"id": "project-1"}]})
                 self.assertEqual(properties["Stream"], {"relation": [{"id": "stream-work"}]})
 
-    def test_notion_project_overwrites_todoist_labels(self):
+    def test_changed_todoist_label_updates_notion_project(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True
         todoist.api_token = "token"
@@ -323,8 +348,10 @@ class TaskSyncTest(unittest.TestCase):
                 }
             }
             result = SyncResult(errors=[])
+            service._update_notion_from_todoist = Mock()
             service._sync_notion_task(notion, {"todo-1": todo}, state, result)
-            todoist.update_task_labels.assert_called_once_with("todo-1", ["Notion Project"])
+            service._update_notion_from_todoist.assert_called_once()
+            todoist.update_task_labels.assert_not_called()
 
     def test_notion_stream_moves_task_to_inbox_section(self):
         todoist = Mock(spec=TodoistClient)
