@@ -113,6 +113,43 @@ class TodoistMappingTest(unittest.TestCase):
 
 
 class TaskSyncTest(unittest.TestCase):
+    def test_fresh_deployment_rebuilds_todoist_from_notion(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            notion = {
+                "page_id": "page-1",
+                "title": "Task",
+                "description": "",
+                "status": "Backlog",
+                "priority": "P2",
+                "due_date": None,
+                "deadline": None,
+                "todoist_id": "todo-1",
+                "project_name": "",
+                "stream_name": "",
+                "inbox_project_id": "inbox-1",
+                "section_id": "section-other",
+                "last_edited_time": "2026-06-01T10:00:00Z",
+            }
+            todo = {
+                "id": "todo-1",
+                "content": "Changed in Todoist",
+                "priority": 2,
+                "labels": [],
+                "project_id": "inbox-1",
+                "section_id": None,
+                "is_completed": False,
+                "updated_at": "2026-06-12T10:00:00Z",
+            }
+            result = SyncResult(errors=[])
+            service._mark_notion_sync = Mock()
+            service._sync_notion_task(notion, {"todo-1": todo}, {}, result)
+            todoist.update_task.assert_called_once_with("todo-1", notion)
+            todoist.update_task_location.assert_called_once_with("todo-1", "inbox-1", "section-other")
+
     def test_linked_unchanged_task_does_not_sync_again(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True

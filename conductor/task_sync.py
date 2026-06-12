@@ -268,10 +268,11 @@ class TaskSyncService:
         notion_changed = notion_fingerprint != prior.get("notion")
         todoist_changed = todoist_fingerprint != prior.get("todoist")
         if not prior:
-            notion_changed = _parse_time(notion_task["last_edited_time"]) >= _parse_time(
-                todoist_task.get("updated_at") or todoist_task.get("added_at")
-            )
-            todoist_changed = not notion_changed
+            # Notion is the information core. After a fresh deployment, rebuild
+            # Todoist from Notion instead of treating missing sync history as a
+            # user edit made in Todoist.
+            notion_changed = True
+            todoist_changed = False
 
         if todoist_changed and not notion_changed:
             self._update_notion_from_todoist(notion_task["page_id"], todoist_task, projects, streams, sections)
@@ -296,7 +297,7 @@ class TaskSyncService:
             self._enforce_todoist_routing(notion_task, todoist_task)
         state[notion_task["page_id"]] = {
             "notion": notion_fingerprint,
-            "todoist": todoist_fingerprint,
+            "todoist": _fingerprint(todoist_task),
             "todoist_id": todoist_id,
         }
 
@@ -306,6 +307,7 @@ class TaskSyncService:
         expected_labels = [notion_task["project_name"]] if notion_task.get("project_name") else []
         if todoist_task.get("labels", []) != expected_labels:
             self.todoist.update_task_labels(notion_task["todoist_id"], expected_labels)
+            todoist_task["labels"] = expected_labels
         expected_section = notion_task.get("section_id")
         if notion_task.get("inbox_project_id") and (
             str(todoist_task.get("project_id")) != notion_task["inbox_project_id"]
@@ -316,6 +318,8 @@ class TaskSyncService:
                 notion_task["inbox_project_id"],
                 expected_section,
             )
+            todoist_task["project_id"] = notion_task["inbox_project_id"]
+            todoist_task["section_id"] = expected_section
 
     def _list_notion_tasks(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
