@@ -25,13 +25,13 @@ services:
       - key: OPENAI_TRANSCRIBE_MODEL
         value: gpt-4o-mini-transcribe
       - key: TODOIST_ENABLED
-        value: false
+        value: true
       - key: TODOIST_SYNC_INTERVAL_SECONDS
         value: 300
       - key: TODOIST_SYNC_ON_START
         value: true
       - key: TODOIST_SYNC_PAUSED
-        value: true
+        value: false
       - key: TODOIST_SYNC_STATE_PATH
         value: /var/data/todoist_sync_state.json
       - key: TODOIST_COMPLETED_SINCE
