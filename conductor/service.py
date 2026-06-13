@@ -30,7 +30,9 @@ class ConductorService:
             settings.notion_projects_database_id,
         )
         self.telegram = TelegramClient(settings.telegram_bot_token)
-        self.todoist = TodoistClient(settings.todoist_api_token, settings.todoist_enabled)
+        # A configured token is enough to enable the client. The dedicated
+        # TODOIST_SYNC_PAUSED flag is the single operational kill switch.
+        self.todoist = TodoistClient(settings.todoist_api_token, settings.todoist_enabled or bool(settings.todoist_api_token))
         self.task_sync = TaskSyncService(
             settings.notion_token,
             settings.notion_tasks_database_id,
