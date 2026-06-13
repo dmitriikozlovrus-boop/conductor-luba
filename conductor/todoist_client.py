@@ -271,7 +271,7 @@ def _task_payload(item: TaskItem | dict[str, Any]) -> dict[str, Any]:
 
 
 def _priority(value: str) -> int:
-    return {"P1": 1, "P2": 2, "P3": 3, "P4": 4}.get(value, 4)
+    return {"P1": 4, "P2": 3, "P3": 2, "P4": 1}.get(value, 1)
 
 
 def todoist_priority(value: int | str | None) -> str:
@@ -279,7 +279,7 @@ def todoist_priority(value: int | str | None) -> str:
         number = int(value or 1)
     except (TypeError, ValueError):
         number = 1
-    return {1: "P1", 2: "P2", 3: "P3"}.get(number, "P4")
+    return {4: "P1", 3: "P2", 2: "P3"}.get(number, "P4")
 
 
 def _as_datetime(value: str) -> datetime:

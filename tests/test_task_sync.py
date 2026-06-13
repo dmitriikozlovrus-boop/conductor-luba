@@ -25,8 +25,8 @@ from conductor.todoist_client import TodoistClient, _task_payload, todoist_prior
 
 class TodoistMappingTest(unittest.TestCase):
     def test_priority_mapping_round_trip(self):
-        self.assertEqual(todoist_priority(1), "P1")
-        self.assertEqual(todoist_priority(4), "P4")
+        self.assertEqual(todoist_priority(4), "P1")
+        self.assertEqual(todoist_priority(1), "P4")
         self.assertEqual(_strategic_to_priority("9"), "P1")
         self.assertEqual(_strategic_to_priority("7"), "P2")
         self.assertEqual(_priority_to_strategic("P3"), "5")
@@ -42,7 +42,7 @@ class TodoistMappingTest(unittest.TestCase):
             }
         )
         self.assertEqual(payload["content"], "Подготовить письмо")
-        self.assertEqual(payload["priority"], 1)
+        self.assertEqual(payload["priority"], 4)
         self.assertEqual(payload["due_date"], "2026-06-13")
         self.assertEqual(payload["deadline_date"], "2026-06-15")
 
@@ -751,14 +751,13 @@ class TaskSyncTest(unittest.TestCase):
             service._update_notion_from_todoist.assert_called_once()
             todoist.update_task.assert_not_called()
 
-    def test_completed_notion_task_is_created_and_closed_in_todoist(self):
+    def test_completed_unlinked_notion_task_is_not_created_in_todoist(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True
         todoist.api_token = "token"
-        todoist.create_task.return_value = "todo-1"
         with tempfile.TemporaryDirectory() as directory:
             service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
-            service._set_notion_todoist_id = Mock()
+            service._mark_notion_sync = Mock()
             notion = {
                 "page_id": "page-1",
                 "title": "Завершённая задача",
@@ -772,10 +771,91 @@ class TaskSyncTest(unittest.TestCase):
                 "last_edited_time": "2026-06-11T10:00:00Z",
             }
             result = SyncResult(errors=[])
+            state = {}
+            service._sync_notion_task(notion, {}, state, result)
+            todoist.create_task.assert_not_called()
+            todoist.close_task.assert_not_called()
+            service._mark_notion_sync.assert_called_once_with("page-1", "Synced")
+            self.assertEqual(state["page-1"]["todoist_id"], "")
+
+    def test_linked_active_task_missing_from_todoist_is_cancelled_not_recreated(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            service._update_notion_status = Mock()
+            notion = {
+                "page_id": "page-1",
+                "title": "Описать MVP",
+                "description": "",
+                "status": "Backlog",
+                "priority": "P3",
+                "due_date": None,
+                "deadline": None,
+                "todoist_id": "todo-1",
+                "last_edited_time": "2026-06-11T10:00:00Z",
+            }
+            result = SyncResult(errors=[])
             service._sync_notion_task(notion, {}, {}, result)
-            todoist.create_task.assert_called_once_with(notion)
-            todoist.close_task.assert_called_once_with("todo-1")
-            self.assertEqual(result.completed, 1)
+            todoist.create_task.assert_not_called()
+            service._update_notion_status.assert_called_once_with("page-1", "Cancelled")
+            self.assertEqual(result.todoist_to_notion, 1)
+
+    def test_missing_task_is_not_cancelled_when_completed_history_is_unavailable(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            service._update_notion_status = Mock()
+            notion = {
+                "page_id": "page-1",
+                "title": "Task",
+                "status": "Backlog",
+                "todoist_id": "todo-1",
+            }
+            with self.assertRaisesRegex(RuntimeError, "completed history was unavailable"):
+                service._sync_notion_task(
+                    notion,
+                    {},
+                    {},
+                    SyncResult(errors=[]),
+                    allow_missing_todoist_resolution=False,
+                )
+            service._update_notion_status.assert_not_called()
+
+    def test_stale_sync_error_is_cleared_for_unchanged_task(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            service._mark_notion_sync = Mock()
+            notion = {
+                "page_id": "page-1",
+                "title": "Task",
+                "description": "",
+                "status": "Backlog",
+                "priority": "P2",
+                "due_date": None,
+                "deadline": None,
+                "todoist_id": "todo-1",
+                "sync_status": "Error",
+                "sync_error": "Old error",
+                "last_edited_time": "2026-06-11T10:00:00Z",
+            }
+            todo = {
+                "id": "todo-1",
+                "content": "Task",
+                "description": "",
+                "priority": 3,
+                "is_completed": False,
+                "updated_at": "2026-06-11T10:00:00Z",
+            }
+            state = {"page-1": {"notion": _fingerprint(notion), "todoist": _fingerprint(todo), "todoist_id": "todo-1"}}
+            service._sync_notion_task(notion, {"todo-1": todo}, state, SyncResult(errors=[]))
+            service._mark_notion_sync.assert_called_once_with("page-1", "Synced")
 
 
 if __name__ == "__main__":

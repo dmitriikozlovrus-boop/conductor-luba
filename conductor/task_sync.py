@@ -93,9 +93,17 @@ class TaskSyncService:
             result.labels_created = self._ensure_todoist_project_labels(projects)
             inbox_project_id, sections, result.sections_created = self._ensure_todoist_stream_sections(streams)
             active_tasks = self.todoist.list_tasks()
-            completed_since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            meta = state.get("__meta__", {})
+            history_imported = bool(meta.get("completed_history_imported"))
+            completed_since = (
+                (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                if history_imported
+                else self.completed_since
+            )
+            completed_history_loaded = False
             try:
                 completed_tasks = self.todoist.list_completed_tasks(completed_since)
+                completed_history_loaded = True
             except Exception as exc:  # noqa: BLE001
                 completed_tasks = []
                 result.errors.append(f"Could not load completed Todoist tasks: {exc}")
@@ -106,10 +114,19 @@ class TaskSyncService:
 
             for notion_task in notion_tasks:
                 try:
-                    self._sync_notion_task(notion_task, todoist_tasks, state, result, projects, streams, sections)
+                    self._sync_notion_task(
+                        notion_task,
+                        todoist_tasks,
+                        state,
+                        result,
+                        projects,
+                        streams,
+                        sections,
+                        allow_missing_todoist_resolution=completed_history_loaded,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(f"{notion_task['title']}: {exc}")
-                    self._mark_notion_sync(notion_task["page_id"], "Error")
+                    self._mark_notion_sync(notion_task["page_id"], "Error", str(exc))
 
             for todoist_id, todoist_task in todoist_tasks.items():
                 if todoist_id in linked_ids:
@@ -120,7 +137,9 @@ class TaskSyncService:
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(f"Todoist {todoist_id}: {exc}")
             state["__meta__"] = {
+                **meta,
                 "last_successful_sync": datetime.now(timezone.utc).isoformat(),
+                "completed_history_imported": history_imported or completed_history_loaded,
             }
             self._save_state(state)
             return result.as_dict()
@@ -220,17 +239,23 @@ class TaskSyncService:
         projects: dict[str, dict[str, str]] | None = None,
         streams: dict[str, dict[str, str]] | None = None,
         sections: dict[str, str] | None = None,
+        allow_missing_todoist_resolution: bool = True,
     ) -> None:
         projects = projects or {}
         streams = streams or {}
         sections = sections or {}
         todoist_id = notion_task["todoist_id"]
         if not todoist_id:
+            if notion_task["status"] in {"Done", "Cancelled"}:
+                self._mark_notion_sync(notion_task["page_id"], "Synced")
+                state[notion_task["page_id"]] = {
+                    "notion": _fingerprint(notion_task),
+                    "todoist": "",
+                    "todoist_id": "",
+                }
+                return
             created_id = self.todoist.create_task(notion_task)
             self._set_notion_todoist_id(notion_task["page_id"], str(created_id), "Synced")
-            if notion_task["status"] in {"Done", "Cancelled"}:
-                self.todoist.close_task(str(created_id))
-                result.completed += 1
             state[notion_task["page_id"]] = {
                 "notion": _fingerprint(notion_task),
                 "todoist": "",
@@ -241,6 +266,8 @@ class TaskSyncService:
 
         todoist_task = todoist_tasks.get(todoist_id)
         if not todoist_task:
+            if not allow_missing_todoist_resolution:
+                raise RuntimeError("Could not verify missing Todoist task because completed history was unavailable")
             if notion_task["status"] in {"Done", "Cancelled"}:
                 self._mark_notion_sync(notion_task["page_id"], "Synced")
                 state[notion_task["page_id"]] = {
@@ -249,15 +276,18 @@ class TaskSyncService:
                     "todoist_id": todoist_id,
                 }
                 return
-            # Active Notion task linked to a missing Todoist task is recreated.
-            created_id = self.todoist.create_task(notion_task)
-            self._set_notion_todoist_id(notion_task["page_id"], str(created_id), "Synced")
+            # Todoist is the primary task interface. A linked task that no
+            # longer exists there must not be resurrected from an old Notion
+            # record. Historical completed tasks are loaded before this point;
+            # anything still missing is treated as deleted.
+            self._update_notion_status(notion_task["page_id"], "Cancelled")
+            notion_task["status"] = "Cancelled"
             state[notion_task["page_id"]] = {
                 "notion": _fingerprint(notion_task),
                 "todoist": "",
-                "todoist_id": str(created_id),
+                "todoist_id": todoist_id,
             }
-            result.notion_to_todoist += 1
+            result.todoist_to_notion += 1
             return
 
         prior = state.get(notion_task["page_id"], {})
@@ -316,6 +346,8 @@ class TaskSyncService:
                 _apply_notion_snapshot_to_todoist(todoist_task, notion_task)
                 self._mark_notion_sync(notion_task["page_id"], "Synced")
                 result.notion_to_todoist += 1
+        elif notion_task.get("sync_status") != "Synced" or notion_task.get("sync_error"):
+            self._mark_notion_sync(notion_task["page_id"], "Synced")
         state[notion_task["page_id"]] = _state_entry(notion_task, todoist_task)
 
     def _update_todoist_from_notion(self, notion_task: dict[str, Any], todoist_task: dict[str, Any]) -> None:
@@ -561,6 +593,7 @@ class TaskSyncService:
         properties.update(_notion_routing_from_todoist(task, projects or {}, streams or {}, sections or {}))
         properties["Todoist ID"] = _rich_text(str(task["id"]))
         properties["Sync status"] = _select("Synced")
+        properties["Sync error"] = _rich_text("")
         properties["Source"] = _select("Todoist")
         request_json(
             "POST",
@@ -581,6 +614,7 @@ class TaskSyncService:
         properties = _notion_properties_from_todoist(task, current_status=current_status)
         properties.update(_notion_routing_from_todoist(task, projects or {}, streams or {}, sections or {}))
         properties["Sync status"] = _select("Synced")
+        properties["Sync error"] = _rich_text("")
         request_json(
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
@@ -610,15 +644,21 @@ class TaskSyncService:
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=self.notion_headers,
-            payload={"properties": {"Todoist ID": _rich_text(todoist_id), "Sync status": _select(status)}},
+            payload={
+                "properties": {
+                    "Todoist ID": _rich_text(todoist_id),
+                    "Sync status": _select(status),
+                    "Sync error": _rich_text(""),
+                }
+            },
         )
 
-    def _mark_notion_sync(self, page_id: str, status: str) -> None:
+    def _mark_notion_sync(self, page_id: str, status: str, error: str = "") -> None:
         request_json(
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=self.notion_headers,
-            payload={"properties": {"Sync status": _select(status)}},
+            payload={"properties": {"Sync status": _select(status), "Sync error": _rich_text(error)}},
         )
 
     def _update_notion_status(self, page_id: str, status: str) -> None:
@@ -626,7 +666,13 @@ class TaskSyncService:
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=self.notion_headers,
-            payload={"properties": {"Статус": _status(status), "Sync status": _select("Synced")}},
+            payload={
+                "properties": {
+                    "Статус": _status(status),
+                    "Sync status": _select("Synced"),
+                    "Sync error": _rich_text(""),
+                }
+            },
         )
 
     def _load_state(self) -> dict[str, Any]:
@@ -661,6 +707,8 @@ class TaskSyncService:
             "due_date": _plain_date(props.get("Срок выполнения")),
             "deadline": _plain_date(props.get("Deadline")),
             "todoist_id": _plain_rich_text(props.get("Todoist ID")),
+            "sync_status": _plain_select(props.get("Sync status")),
+            "sync_error": _plain_rich_text(props.get("Sync error")),
             "project_id": _plain_relation_id(props.get("Проект")),
             "stream_id": _plain_relation_id(props.get("Stream")),
             "last_edited_time": row.get("last_edited_time", ""),
@@ -778,6 +826,8 @@ def _title(value: str) -> dict[str, Any]:
 
 
 def _rich_text(value: str) -> dict[str, Any]:
+    if not value:
+        return {"rich_text": []}
     return {"rich_text": [{"type": "text", "text": {"content": value[:2000]}}]}
 
 
@@ -887,7 +937,7 @@ def _apply_notion_snapshot_to_todoist(todoist_task: dict[str, Any], notion_task:
         {
             "content": notion_task.get("title") or "Без названия",
             "description": notion_task.get("description") or "",
-            "priority": {"P1": 1, "P2": 2, "P3": 3, "P4": 4}.get(notion_task.get("priority"), 4),
+            "priority": {"P1": 4, "P2": 3, "P3": 2, "P4": 1}.get(notion_task.get("priority"), 1),
             "due": {"date": notion_task["due_date"]} if notion_task.get("due_date") else None,
             "deadline": {"date": notion_task["deadline"]} if notion_task.get("deadline") else None,
             "is_completed": notion_task.get("status") in {"Done", "Cancelled"},
