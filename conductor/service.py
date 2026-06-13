@@ -39,7 +39,7 @@ class ConductorService:
             settings.todoist_sync_state_path,
             settings.todoist_completed_since,
             settings.notion_streams_database_id,
-            paused=True,
+            paused=settings.todoist_sync_paused,
         )
         self.pending = PendingStore(settings.pending_store_path)
         self.recent = RecentStore(settings.recent_store_path)

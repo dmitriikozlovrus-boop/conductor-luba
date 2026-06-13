@@ -90,6 +90,17 @@ class TodoistMappingTest(unittest.TestCase):
         self.assertIn("Deadline", properties)
         self.assertNotIn("Проект", properties)
 
+    def test_todoist_description_is_written_to_notion(self):
+        properties = _notion_properties_from_todoist({"content": "Task", "description": "Details"})
+        self.assertEqual(properties["Описание"]["rich_text"][0]["text"]["content"], "Details")
+
+    def test_active_notion_status_is_preserved_by_active_todoist_task(self):
+        properties = _notion_properties_from_todoist(
+            {"content": "Task", "is_completed": False},
+            current_status="In Progress",
+        )
+        self.assertEqual(properties["Статус"], {"status": {"name": "In Progress"}})
+
     def test_todoist_section_and_label_become_notion_routing(self):
         properties = _notion_routing_from_todoist(
             {"labels": ["Project A"], "section_id": "section-work"},
@@ -207,9 +218,11 @@ class TaskSyncTest(unittest.TestCase):
             }
             result = SyncResult(errors=[])
             service._mark_notion_sync = Mock()
+            service._update_notion_from_todoist = Mock()
             service._sync_notion_task(notion, {"todo-1": todo}, {}, result)
             todoist.update_task.assert_not_called()
             todoist.update_task_location.assert_not_called()
+            service._update_notion_from_todoist.assert_called_once()
 
     def test_todoist_rate_limit_retry_after_is_honored(self):
         self.assertEqual(
@@ -291,6 +304,7 @@ class TaskSyncTest(unittest.TestCase):
                 {},
                 {"работа": {"id": "stream-work", "name": "РАБОТА"}},
                 {"работа": "section-work", "прочее": "section-other"},
+                current_status=None,
             )
             todoist.get_task.assert_called_once_with("todo-1")
             self.assertEqual(result["action"], "upserted_in_notion")
@@ -324,6 +338,7 @@ class TaskSyncTest(unittest.TestCase):
                 {},
                 {"личное": {"id": "stream-personal", "name": "ЛИЧНОЕ"}},
                 {"личное": "section-personal", "прочее": "section-other"},
+                current_status=None,
             )
 
     def test_webhook_project_label_moves_other_task_to_project_stream(self):
@@ -375,7 +390,9 @@ class TaskSyncTest(unittest.TestCase):
             todo = {"id": "todo-1", "content": "Task", "priority": 2, "is_completed": True}
             result = SyncResult(errors=[])
             service._sync_notion_task(notion, {"todo-1": todo}, {}, result)
-            service._update_notion_from_todoist.assert_called_once_with("page-1", todo, {}, {}, {})
+            service._update_notion_from_todoist.assert_called_once_with(
+                "page-1", todo, {}, {}, {}, current_status="Backlog"
+            )
             todoist.reopen_task.assert_not_called()
             self.assertEqual(result.todoist_to_notion, 1)
 
@@ -402,7 +419,7 @@ class TaskSyncTest(unittest.TestCase):
             state = {
                 "page-1": {
                     "notion": _fingerprint(previous_notion),
-                    "todoist": _fingerprint(todo),
+                    "todoist": _fingerprint({**todo, "section_id": "section-work"}),
                     "todoist_id": "todo-1",
                 }
             }
@@ -586,12 +603,12 @@ class TaskSyncTest(unittest.TestCase):
                 }
             }
             result = SyncResult(errors=[])
-            service._update_notion_routing_from_todoist = Mock()
+            service._update_notion_from_todoist = Mock()
             service._sync_notion_task(notion, {"todo-1": todo}, state, result)
-            service._update_notion_routing_from_todoist.assert_called_once()
+            service._update_notion_from_todoist.assert_called_once()
             todoist.update_task_labels.assert_not_called()
 
-    def test_todoist_section_overrides_different_notion_stream(self):
+    def test_later_todoist_section_overrides_different_notion_stream(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True
         todoist.api_token = "token"
@@ -610,7 +627,7 @@ class TaskSyncTest(unittest.TestCase):
                 "stream_name": "РАБОТА",
                 "inbox_project_id": "inbox-1",
                 "section_id": "section-work",
-                "last_edited_time": "2026-06-12T10:00:00Z",
+                "last_edited_time": "2026-06-12T09:00:00Z",
             }
             todo = {
                 "id": "todo-1",
@@ -626,12 +643,12 @@ class TaskSyncTest(unittest.TestCase):
             state = {
                 "page-1": {
                     "notion": _fingerprint(notion),
-                    "todoist": _fingerprint(todo),
+                    "todoist": _fingerprint({**todo, "section_id": "section-work"}),
                     "todoist_id": "todo-1",
                 }
             }
             result = SyncResult(errors=[])
-            service._update_notion_routing_from_todoist = Mock()
+            service._update_notion_from_todoist = Mock()
             service._sync_notion_task(
                 notion,
                 {"todo-1": todo},
@@ -644,9 +661,95 @@ class TaskSyncTest(unittest.TestCase):
                 },
                 {"работа": "section-work", "личное": "section-personal", "прочее": "section-other"},
             )
-            service._update_notion_routing_from_todoist.assert_called_once()
+            service._update_notion_from_todoist.assert_called_once()
             todoist.update_task_location.assert_not_called()
             self.assertEqual(result.todoist_to_notion, 1)
+
+    def test_later_notion_section_overrides_todoist_section(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            service._mark_notion_sync = Mock()
+            notion = {
+                "page_id": "page-1",
+                "title": "Task",
+                "description": "",
+                "status": "Backlog",
+                "priority": "P2",
+                "due_date": None,
+                "deadline": None,
+                "todoist_id": "todo-1",
+                "project_name": "",
+                "stream_name": "РАБОТА",
+                "inbox_project_id": "inbox-1",
+                "section_id": "section-work",
+                "last_edited_time": "2026-06-12T11:00:00Z",
+            }
+            previous_notion = {**notion, "stream_name": "ЛИЧНОЕ", "section_id": "section-personal"}
+            todo = {
+                "id": "todo-1",
+                "content": "Task",
+                "description": "",
+                "priority": 2,
+                "labels": [],
+                "project_id": "inbox-1",
+                "section_id": "section-personal",
+                "is_completed": False,
+                "updated_at": "2026-06-12T10:00:00Z",
+            }
+            state = {
+                "page-1": {
+                    "notion": _fingerprint(previous_notion),
+                    "todoist": _fingerprint(todo),
+                    "todoist_id": "todo-1",
+                }
+            }
+            result = SyncResult(errors=[])
+            service._sync_notion_task(notion, {"todo-1": todo}, state, result)
+            todoist.update_task_location.assert_called_once_with("todo-1", "inbox-1", "section-work")
+            self.assertEqual(result.notion_to_todoist, 1)
+
+    def test_equal_conflict_timestamp_prefers_todoist(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            service._update_notion_from_todoist = Mock()
+            notion = {
+                "page_id": "page-1",
+                "title": "Changed in Notion",
+                "description": "",
+                "status": "Backlog",
+                "priority": "P2",
+                "due_date": None,
+                "deadline": None,
+                "todoist_id": "todo-1",
+                "last_edited_time": "2026-06-12T10:00:00Z",
+            }
+            todo = {
+                "id": "todo-1",
+                "content": "Changed in Todoist",
+                "description": "",
+                "priority": 2,
+                "is_completed": False,
+                "updated_at": "2026-06-12T10:00:00Z",
+            }
+            baseline_notion = {**notion, "title": "Baseline"}
+            baseline_todo = {**todo, "content": "Baseline"}
+            state = {
+                "page-1": {
+                    "notion": _fingerprint(baseline_notion),
+                    "todoist": _fingerprint(baseline_todo),
+                    "todoist_id": "todo-1",
+                }
+            }
+            result = SyncResult(errors=[])
+            service._sync_notion_task(notion, {"todo-1": todo}, state, result)
+            service._update_notion_from_todoist.assert_called_once()
+            todoist.update_task.assert_not_called()
 
     def test_completed_notion_task_is_created_and_closed_in_todoist(self):
         todoist = Mock(spec=TodoistClient)

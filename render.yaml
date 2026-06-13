@@ -30,6 +30,8 @@ services:
         value: 300
       - key: TODOIST_SYNC_ON_START
         value: true
+      - key: TODOIST_SYNC_PAUSED
+        value: true
       - key: TODOIST_SYNC_STATE_PATH
         value: /var/data/todoist_sync_state.json
       - key: TODOIST_COMPLETED_SINCE
