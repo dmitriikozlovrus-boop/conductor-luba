@@ -35,9 +35,6 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path == "/ops/activate-todoist-primary-20260614-48725d8":
-            self._json(200, {"ok": True, "todoist_sync_mode": service.task_sync.set_runtime_mode("todoist-primary")})
-            return
         if self.path == "/tasks/sync":
             self._handle_manual_sync()
             return
