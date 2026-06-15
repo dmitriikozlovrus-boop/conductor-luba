@@ -32,6 +32,24 @@ services:
         value: true
       - key: TODOIST_SYNC_PAUSED
         value: false
+      - key: TODOIST_SYNC_MODE
+        value: observe
+      - key: TODOIST_ALLOW_PROJECT_CREATE
+        value: false
+      - key: TODOIST_ALLOW_TASK_CREATE
+        value: false
+      - key: TODOIST_ALLOW_TASK_MOVE
+        value: false
+      - key: TODOIST_ALLOW_LABEL_WRITE
+        value: false
+      - key: TODOIST_ALLOW_STATUS_WRITE
+        value: false
+      - key: TODOIST_ALLOW_MISSING_CANCEL
+        value: false
+      - key: TODOIST_MAX_TASK_MOVES
+        value: 10
+      - key: TODOIST_SNAPSHOT_PATH
+        value: /var/data/todoist_inventory_snapshot.json
       - key: TODOIST_SYNC_STATE_PATH
         value: /var/data/todoist_sync_state.json
       - key: TODOIST_COMPLETED_SINCE

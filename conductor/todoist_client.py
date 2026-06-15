@@ -75,6 +75,22 @@ class TodoistClient:
     def list_projects(self) -> list[dict[str, Any]]:
         return self._list_resource("projects")
 
+    def create_project(self, name: str, parent_id: str | None = None) -> str | None:
+        payload: dict[str, Any] = {"name": name}
+        if parent_id:
+            payload["parent_id"] = parent_id
+        response = request_json("POST", f"{API_BASE}/projects", headers=self.headers, payload=payload)
+        return response.get("id")
+
+    def update_project(self, project_id: str, *, name: str | None = None, parent_id: str | None = None) -> None:
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if parent_id is not None:
+            payload["parent_id"] = parent_id
+        if payload:
+            request_json("POST", f"{API_BASE}/projects/{project_id}", headers=self.headers, payload=payload)
+
     def list_sections(self) -> list[dict[str, Any]]:
         return self._list_resource("sections")
 
@@ -259,14 +275,14 @@ def _task_payload(item: TaskItem | dict[str, Any]) -> dict[str, Any]:
     if deadline:
         payload["deadline_date"] = deadline
     labels = item.get("labels") if isinstance(item, dict) else None
-    if isinstance(item, dict) and "project_name" in item:
-        labels = [item["project_name"]] if item.get("project_name") else []
+    if isinstance(item, dict) and "managed_labels" in item:
+        labels = item.get("managed_labels") or []
     if labels is not None:
         payload["labels"] = labels
-    if isinstance(item, dict) and item.get("inbox_project_id"):
-        payload["project_id"] = item["inbox_project_id"]
-        if item.get("section_id"):
-            payload["section_id"] = item["section_id"]
+    if isinstance(item, dict) and item.get("todoist_project_id"):
+        payload["project_id"] = item["todoist_project_id"]
+        if item.get("todoist_section_id"):
+            payload["section_id"] = item["todoist_section_id"]
     return payload
 
 

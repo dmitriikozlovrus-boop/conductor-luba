@@ -42,6 +42,15 @@ class ConductorService:
             settings.todoist_completed_since,
             settings.notion_streams_database_id,
             paused=settings.todoist_sync_paused,
+            mode=settings.todoist_sync_mode,
+            allow_project_create=settings.todoist_allow_project_create,
+            allow_task_create=settings.todoist_allow_task_create,
+            allow_task_move=settings.todoist_allow_task_move,
+            allow_label_write=settings.todoist_allow_label_write,
+            allow_status_write=settings.todoist_allow_status_write,
+            allow_missing_cancel=settings.todoist_allow_missing_cancel,
+            max_task_moves=settings.todoist_max_task_moves,
+            snapshot_path=settings.todoist_snapshot_path,
         )
         self.pending = PendingStore(settings.pending_store_path)
         self.recent = RecentStore(settings.recent_store_path)

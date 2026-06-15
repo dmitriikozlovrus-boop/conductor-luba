@@ -13,7 +13,20 @@ from .http import HttpError, request_json
 from .todoist_client import TodoistClient, todoist_priority
 
 NOTION_VERSION = "2022-06-28"
-OTHER_SECTION_NAME = "ПРОЧЕЕ"
+MANAGED_TODOIST_LABELS = {
+    "встреча",
+    "звонок",
+    "письмо",
+    "сообщение",
+    "документ",
+    "анализ",
+    "исследование",
+    "планирование",
+    "низкая_энергия",
+    "средняя_энергия",
+    "высокая_энергия",
+    "пятиминутное_дело",
+}
 
 
 @dataclass
@@ -23,6 +36,10 @@ class SyncResult:
     completed: int = 0
     labels_created: int = 0
     sections_created: int = 0
+    mode: str = "observe"
+    inventory: dict[str, int] | None = None
+    planned: dict[str, int] | None = None
+    snapshot_path: str = ""
     errors: list[str] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -32,6 +49,10 @@ class SyncResult:
             "completed": self.completed,
             "labels_created": self.labels_created,
             "sections_created": self.sections_created,
+            "mode": self.mode,
+            "inventory": self.inventory or {},
+            "planned": self.planned or {},
+            "snapshot_path": self.snapshot_path,
             "errors": self.errors or [],
         }
 
@@ -47,6 +68,15 @@ class TaskSyncService:
         completed_since: str = "2007-01-01",
         streams_database_id: str = "",
         paused: bool = False,
+        mode: str = "observe",
+        allow_project_create: bool = False,
+        allow_task_create: bool = False,
+        allow_task_move: bool = False,
+        allow_label_write: bool = False,
+        allow_status_write: bool = False,
+        allow_missing_cancel: bool = False,
+        max_task_moves: int = 10,
+        snapshot_path: str = "data/todoist_inventory_snapshot.json",
     ):
         self.notion_token = notion_token
         self.tasks_database_id = tasks_database_id
@@ -56,6 +86,16 @@ class TaskSyncService:
         self.completed_since = completed_since
         self.streams_database_id = streams_database_id
         self.paused = paused
+        self.mode = mode if mode in {"observe", "write"} else "observe"
+        self.allow_project_create = allow_project_create
+        self.allow_task_create = allow_task_create
+        self.allow_task_move = allow_task_move
+        self.allow_label_write = allow_label_write
+        self.allow_status_write = allow_status_write
+        self.allow_missing_cancel = allow_missing_cancel
+        self.max_task_moves = max(max_task_moves, 0)
+        self.snapshot_path = Path(snapshot_path)
+        self._task_moves = 0
         self._lock = threading.Lock()
 
     @property
@@ -78,7 +118,7 @@ class TaskSyncService:
         )
 
     def sync(self) -> dict[str, Any]:
-        result = SyncResult(errors=[])
+        result = SyncResult(errors=[], mode=self.mode)
         if not self.enabled:
             result.errors.append("Todoist sync is not configured")
             return result.as_dict()
@@ -90,9 +130,45 @@ class TaskSyncService:
             notion_tasks = self._list_notion_tasks()
             streams = self._list_notion_streams()
             projects = self._list_notion_projects()
-            result.labels_created = self._ensure_todoist_project_labels(projects)
-            inbox_project_id, sections, result.sections_created = self._ensure_todoist_stream_sections(streams)
+            todoist_projects = self.todoist.list_projects()
+            sections = self.todoist.list_sections()
+            labels = self.todoist.list_labels()
             active_tasks = self.todoist.list_tasks()
+            result.inventory = {
+                "notion_tasks": len(notion_tasks),
+                "todoist_active_tasks": len(active_tasks),
+                "notion_projects": len(projects),
+                "todoist_projects": len(todoist_projects),
+                "notion_streams": len(streams),
+                "todoist_sections": len(sections),
+                "todoist_labels": len(labels),
+            }
+            result.planned = self._migration_plan(
+                notion_tasks,
+                projects,
+                streams,
+                todoist_projects,
+                sections,
+                active_tasks,
+            )
+            result.snapshot_path = str(
+                self._save_inventory_snapshot(
+                    notion_tasks,
+                    projects,
+                    streams,
+                    todoist_projects,
+                    sections,
+                    labels,
+                    active_tasks,
+                    result.planned,
+                )
+            )
+            if self.mode == "observe":
+                return result.as_dict()
+
+            self._ensure_todoist_project_hierarchy(projects, streams, todoist_projects, result)
+            todoist_projects = self.todoist.list_projects()
+            self._attach_notion_routing(notion_tasks, projects, streams, todoist_projects, sections)
             meta = state.get("__meta__", {})
             history_imported = bool(meta.get("completed_history_imported"))
             completed_since = (
@@ -116,8 +192,6 @@ class TaskSyncService:
             todoist_tasks = {str(task["id"]): task for task in [*active_tasks, *completed_tasks]}
             linked_ids = {task["todoist_id"] for task in notion_tasks if task["todoist_id"]}
             self._link_existing_matches(notion_tasks, todoist_tasks, linked_ids)
-            self._attach_notion_routing(notion_tasks, projects, streams, inbox_project_id, sections)
-
             for notion_task in notion_tasks:
                 try:
                     self._sync_notion_task(
@@ -127,6 +201,7 @@ class TaskSyncService:
                         result,
                         projects,
                         streams,
+                        todoist_projects,
                         sections,
                         allow_missing_todoist_resolution=completed_history_loaded,
                     )
@@ -139,7 +214,7 @@ class TaskSyncService:
                 if todoist_id in linked_ids:
                     continue
                 try:
-                    self._create_notion_from_todoist(todoist_task, projects, streams, sections)
+                    self._create_notion_from_todoist(todoist_task, projects, streams, todoist_projects, sections)
                     result.todoist_to_notion += 1
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(f"Todoist {todoist_id}: {exc}")
@@ -179,6 +254,8 @@ class TaskSyncService:
     def handle_todoist_event(self, event: dict[str, Any]) -> dict[str, Any]:
         if not self.enabled:
             return {"ignored": True, "reason": "sync disabled"}
+        if self.mode == "observe":
+            return {"ignored": True, "reason": "sync is in observe mode"}
         # Webhooks and periodic reconciliation share the same state file.
         # Serialize them so a webhook cannot be overwritten by an older sync snapshot.
         with self._lock:
@@ -192,24 +269,25 @@ class TaskSyncService:
             return {"ignored": True, "reason": "missing task id"}
         notion_task = self._find_notion_by_todoist_id(task_id)
         if event_name == "item:deleted":
-            if notion_task:
+            if notion_task and self.allow_missing_cancel:
                 self._update_notion_status(notion_task["page_id"], "Cancelled")
                 self._forget_state(notion_task["page_id"])
-            return {"ok": True, "action": "cancelled_in_notion"}
+            return {"ok": True, "action": "cancelled_in_notion" if self.allow_missing_cancel else "deletion_observed"}
         if event_name == "item:completed":
-            if notion_task:
+            if notion_task and self.allow_status_write:
                 self._update_notion_status(notion_task["page_id"], "Done")
                 self._forget_state(notion_task["page_id"])
-            return {"ok": True, "action": "completed_in_notion"}
+            return {"ok": True, "action": "completed_in_notion" if self.allow_status_write else "completion_observed"}
         if event_name == "item:uncompleted":
-            if notion_task:
+            if notion_task and self.allow_status_write:
                 self._update_notion_status(notion_task["page_id"], "Backlog")
                 self._forget_state(notion_task["page_id"])
-            return {"ok": True, "action": "reopened_in_notion"}
+            return {"ok": True, "action": "reopened_in_notion" if self.allow_status_write else "reopen_observed"}
         if event_name in {"item:added", "item:updated"}:
             projects = self._list_notion_projects()
             streams = self._list_notion_streams()
-            inbox_project_id, sections, _ = self._ensure_todoist_stream_sections(streams)
+            todoist_projects = self.todoist.list_projects()
+            sections = self.todoist.list_sections()
             # Todoist webhook payloads can omit routing fields such as section_id
             # and labels. Always load the complete task before updating Notion,
             # otherwise a partial event can clear routing and move the task to
@@ -221,18 +299,14 @@ class TaskSyncService:
                     task,
                     projects,
                     streams,
+                    todoist_projects,
                     sections,
                     current_status=notion_task.get("status"),
                 )
             else:
-                self._create_notion_from_todoist(task, projects, streams, sections)
-            target_section = _project_stream_section(task, projects, streams, sections)
-            if target_section:
-                self.todoist.update_task_location(task_id, inbox_project_id, target_section)
-                task["project_id"] = inbox_project_id
-                task["section_id"] = target_section
+                self._create_notion_from_todoist(task, projects, streams, todoist_projects, sections)
             if notion_task:
-                _apply_todoist_snapshot_to_notion(notion_task, task, projects, streams, sections)
+                _apply_todoist_snapshot_to_notion(notion_task, task, projects, streams, todoist_projects, sections)
                 self._remember_state(notion_task, task)
             return {"ok": True, "action": "upserted_in_notion"}
         return {"ignored": True, "reason": f"unsupported event {event_name}"}
@@ -245,12 +319,14 @@ class TaskSyncService:
         result: SyncResult,
         projects: dict[str, dict[str, str]] | None = None,
         streams: dict[str, dict[str, str]] | None = None,
-        sections: dict[str, str] | None = None,
+        todoist_projects: list[dict[str, Any]] | None = None,
+        sections: list[dict[str, Any]] | None = None,
         allow_missing_todoist_resolution: bool = True,
     ) -> None:
         projects = projects or {}
         streams = streams or {}
-        sections = sections or {}
+        todoist_projects = todoist_projects or []
+        sections = sections or []
         todoist_id = notion_task["todoist_id"]
         if not todoist_id:
             if notion_task["status"] in {"Done", "Cancelled"}:
@@ -261,7 +337,15 @@ class TaskSyncService:
                     "todoist_id": "",
                 }
                 return
-            created_id = self.todoist.create_task(notion_task)
+            if not self.allow_task_create:
+                raise RuntimeError("Task creation is blocked by TODOIST_ALLOW_TASK_CREATE=false")
+            create_payload = dict(notion_task)
+            if not self.allow_label_write:
+                create_payload.pop("managed_labels", None)
+            if not self.allow_task_move:
+                create_payload.pop("todoist_project_id", None)
+                create_payload.pop("todoist_section_id", None)
+            created_id = self.todoist.create_task(create_payload)
             self._set_notion_todoist_id(notion_task["page_id"], str(created_id), "Synced")
             notion_task["todoist_id"] = str(created_id)
             state[notion_task["page_id"]] = {
@@ -288,6 +372,8 @@ class TaskSyncService:
             # longer exists there must not be resurrected from an old Notion
             # record. Historical completed tasks are loaded before this point;
             # anything still missing is treated as deleted.
+            if not self.allow_missing_cancel:
+                raise RuntimeError("Missing Todoist task requires manual review; automatic cancellation is disabled")
             self._update_notion_status(notion_task["page_id"], "Cancelled")
             notion_task["status"] = "Cancelled"
             state[notion_task["page_id"]] = {
@@ -311,10 +397,11 @@ class TaskSyncService:
                 todoist_task,
                 projects,
                 streams,
+                todoist_projects,
                 sections,
                 current_status=notion_task.get("status"),
             )
-            _apply_todoist_snapshot_to_notion(notion_task, todoist_task, projects, streams, sections)
+            _apply_todoist_snapshot_to_notion(notion_task, todoist_task, projects, streams, todoist_projects, sections)
             result.todoist_to_notion += 1
             state[notion_task["page_id"]] = _state_entry(notion_task, todoist_task)
             return
@@ -325,10 +412,11 @@ class TaskSyncService:
                 todoist_task,
                 projects,
                 streams,
+                todoist_projects,
                 sections,
                 current_status=notion_task.get("status"),
             )
-            _apply_todoist_snapshot_to_notion(notion_task, todoist_task, projects, streams, sections)
+            _apply_todoist_snapshot_to_notion(notion_task, todoist_task, projects, streams, todoist_projects, sections)
             result.todoist_to_notion += 1
         elif notion_changed and not todoist_changed:
             self._update_todoist_from_notion(notion_task, todoist_task)
@@ -344,10 +432,11 @@ class TaskSyncService:
                     todoist_task,
                     projects,
                     streams,
+                    todoist_projects,
                     sections,
                     current_status=notion_task.get("status"),
                 )
-                _apply_todoist_snapshot_to_notion(notion_task, todoist_task, projects, streams, sections)
+                _apply_todoist_snapshot_to_notion(notion_task, todoist_task, projects, streams, todoist_projects, sections)
                 result.todoist_to_notion += 1
             else:
                 self._update_todoist_from_notion(notion_task, todoist_task)
@@ -364,64 +453,50 @@ class TaskSyncService:
         todoist_completed = bool(todoist_task.get("is_completed"))
         if notion_completed:
             if not todoist_completed:
+                if not self.allow_status_write:
+                    raise RuntimeError("Closing Todoist tasks is blocked by TODOIST_ALLOW_STATUS_WRITE=false")
                 self.todoist.close_task(todoist_id)
             return
         if todoist_completed:
+            if not self.allow_status_write:
+                raise RuntimeError("Reopening Todoist tasks is blocked by TODOIST_ALLOW_STATUS_WRITE=false")
             self.todoist.reopen_task(todoist_id)
-        self.todoist.update_task(todoist_id, notion_task)
+        base_fields = dict(notion_task)
+        base_fields.pop("managed_labels", None)
+        base_fields.pop("todoist_project_id", None)
+        base_fields.pop("todoist_section_id", None)
+        self.todoist.update_task(todoist_id, base_fields)
         self._enforce_todoist_routing(notion_task, todoist_task)
 
     def _enforce_todoist_routing(self, notion_task: dict[str, Any], todoist_task: dict[str, Any]) -> None:
         if todoist_task.get("is_completed"):
             return
-        expected_labels = [notion_task["project_name"]] if notion_task.get("project_name") else []
-        if todoist_task.get("labels", []) != expected_labels:
+        existing_labels = list(todoist_task.get("labels") or [])
+        unmanaged_labels = [label for label in existing_labels if not _is_managed_label(label)]
+        expected_labels = sorted(set([*unmanaged_labels, *notion_task.get("managed_labels", [])]))
+        if sorted(existing_labels) != expected_labels:
+            if not self.allow_label_write:
+                raise RuntimeError("Todoist label changes are blocked by TODOIST_ALLOW_LABEL_WRITE=false")
             self.todoist.update_task_labels(notion_task["todoist_id"], expected_labels)
             todoist_task["labels"] = expected_labels
-        expected_section = notion_task.get("section_id")
-        if notion_task.get("inbox_project_id") and (
-            str(todoist_task.get("project_id")) != notion_task["inbox_project_id"]
+        expected_project = notion_task.get("todoist_project_id")
+        expected_section = notion_task.get("todoist_section_id")
+        if expected_project and (
+            str(todoist_task.get("project_id")) != expected_project
             or str(todoist_task.get("section_id") or "") != str(expected_section or "")
         ):
+            if not self.allow_task_move:
+                raise RuntimeError("Todoist task moves are blocked by TODOIST_ALLOW_TASK_MOVE=false")
+            if self._task_moves >= self.max_task_moves:
+                raise RuntimeError(f"Todoist task move limit reached ({self.max_task_moves})")
             self.todoist.update_task_location(
                 notion_task["todoist_id"],
-                notion_task["inbox_project_id"],
+                expected_project,
                 expected_section,
             )
-            todoist_task["project_id"] = notion_task["inbox_project_id"]
+            self._task_moves += 1
+            todoist_task["project_id"] = expected_project
             todoist_task["section_id"] = expected_section
-
-    def _bootstrap_notion_routing(
-        self,
-        notion_tasks: list[dict[str, Any]],
-        todoist_tasks: dict[str, dict[str, Any]],
-        projects: dict[str, dict[str, str]],
-        streams: dict[str, dict[str, str]],
-        sections: dict[str, str],
-    ) -> int:
-        imported = 0
-        for notion_task in notion_tasks:
-            todoist_task = todoist_tasks.get(notion_task.get("todoist_id", ""))
-            if not todoist_task or todoist_task.get("is_completed"):
-                continue
-            properties = _notion_routing_from_todoist(todoist_task, projects, streams, sections)
-            project_id = _plain_relation_id(properties["Проект"])
-            stream_id = _plain_relation_id(properties["Stream"])
-            if (
-                (notion_task.get("project_id") or "") == (project_id or "")
-                and (notion_task.get("stream_id") or "") == (stream_id or "")
-            ):
-                continue
-            request_json(
-                "PATCH",
-                f"https://api.notion.com/v1/pages/{notion_task['page_id']}",
-                headers=self.notion_headers,
-                payload={"properties": properties},
-            )
-            notion_task["project_id"] = project_id
-            notion_task["stream_id"] = stream_id
-            imported += 1
-        return imported
 
     def _list_notion_tasks(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -462,6 +537,12 @@ class TaskSyncService:
                         "id": row.get("id", ""),
                         "name": name,
                         "stream_id": _plain_relation_id(row.get("properties", {}).get("Stream")) or "",
+                        "todoist_project_id": _plain_rich_text(
+                            row.get("properties", {}).get("Todoist Project ID")
+                        ),
+                        "sync_enabled": _plain_checkbox(
+                            row.get("properties", {}).get("Синхронизировать с Todoist")
+                        ),
                     }
             if not data.get("has_more"):
                 break
@@ -486,99 +567,182 @@ class TaskSyncService:
             for row in data.get("results", []):
                 name = _plain_title(row.get("properties", {}).get("Направление"))
                 if name:
-                    streams[_normalize_title(name)] = {"id": row.get("id", ""), "name": name}
+                    streams[_normalize_title(name)] = {
+                        "id": row.get("id", ""),
+                        "name": name,
+                        "todoist_project_id": _plain_rich_text(
+                            row.get("properties", {}).get("Todoist Parent Project ID")
+                        ),
+                    }
             if not data.get("has_more"):
                 break
             cursor = data.get("next_cursor")
         return streams
 
-    def _ensure_todoist_project_labels(self, projects: dict[str, dict[str, str]]) -> int:
-        existing = {_normalize_title(label.get("name")) for label in self.todoist.list_labels()}
-        created = 0
-        for key, project in projects.items():
-            if key in existing:
-                continue
-            self.todoist.create_label(project["name"])
-            existing.add(key)
-            created += 1
-        return created
-
-    def _ensure_todoist_stream_sections(
-        self,
-        streams: dict[str, dict[str, str]],
-    ) -> tuple[str, dict[str, str], int]:
-        inbox = next((project for project in self.todoist.list_projects() if project.get("inbox_project")), None)
-        if not inbox:
-            raise RuntimeError("Todoist Inbox project was not found")
-        inbox_id = str(inbox["id"])
-        sections = {
-            _normalize_title(section.get("name")): str(section["id"])
-            for section in self.todoist.list_sections()
-            if str(section.get("project_id")) == inbox_id
-        }
-        created = 0
-        for key, stream in streams.items():
-            if key in sections:
-                continue
-            section_id = self.todoist.create_section(stream["name"], inbox_id)
-            sections[key] = str(section_id)
-            created += 1
-        other_key = _normalize_title(OTHER_SECTION_NAME)
-        if other_key not in sections:
-            section_id = self.todoist.create_section(OTHER_SECTION_NAME, inbox_id)
-            sections[other_key] = str(section_id)
-            created += 1
-        return inbox_id, sections, created
-
-    def _enrich_missing_notion_routing(
+    def _migration_plan(
         self,
         notion_tasks: list[dict[str, Any]],
-        todoist_tasks: dict[str, dict[str, Any]],
         projects: dict[str, dict[str, str]],
         streams: dict[str, dict[str, str]],
-    ) -> None:
+        todoist_projects: list[dict[str, Any]],
+        sections: list[dict[str, Any]],
+        active_tasks: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        todoist_project_ids = {str(project.get("id")) for project in todoist_projects}
+        mapped_projects = {
+            str(project.get("todoist_project_id"))
+            for project in projects.values()
+            if str(project.get("todoist_project_id") or "") in todoist_project_ids
+        }
+        mapped_streams = {
+            str(stream.get("todoist_project_id"))
+            for stream in streams.values()
+            if str(stream.get("todoist_project_id") or "") in todoist_project_ids
+        }
+        project_by_notion_id = {project["id"]: project for project in projects.values()}
+        sections_by_id = {str(section.get("id")): section for section in sections}
+        active_by_id = {str(task.get("id")): task for task in active_tasks}
+        planned_moves = 0
+        invalid_sections = 0
         for task in notion_tasks:
-            todoist_task = todoist_tasks.get(task.get("todoist_id", ""))
-            if not todoist_task:
-                continue
-            labels = [_normalize_title(label) for label in todoist_task.get("labels") or []]
-            properties: dict[str, Any] = {}
-            if not task.get("project_id"):
-                project = next((projects[label] for label in labels if label in projects), None)
-                if project:
-                    task["project_id"] = project["id"]
-                    properties["Проект"] = _relation(project["id"])
-            if not task.get("stream_id"):
-                stream = next((streams[label] for label in labels if label in streams), None)
-                if stream:
-                    task["stream_id"] = stream["id"]
-                    properties["Stream"] = _relation(stream["id"])
-            if properties:
-                request_json(
-                    "PATCH",
-                    f"https://api.notion.com/v1/pages/{task['page_id']}",
-                    headers=self.notion_headers,
-                    payload={"properties": properties},
+            project = project_by_notion_id.get(str(task.get("project_id") or ""))
+            target_project_id = str((project or {}).get("todoist_project_id") or "")
+            target_section_id = str(task.get("todoist_section_id") or "")
+            section = sections_by_id.get(target_section_id)
+            if target_section_id and (not section or str(section.get("project_id")) != target_project_id):
+                invalid_sections += 1
+            todoist_task = active_by_id.get(str(task.get("todoist_id") or ""))
+            if todoist_task and target_project_id and (
+                str(todoist_task.get("project_id") or "") != target_project_id
+                or (
+                    target_section_id
+                    and str(todoist_task.get("section_id") or "") != target_section_id
                 )
+            ):
+                planned_moves += 1
+        return {
+            "unmapped_notion_projects": sum(
+                1 for project in projects.values() if not project.get("todoist_project_id")
+            ),
+            "projects_eligible_for_creation": sum(
+                1
+                for project in projects.values()
+                if project.get("sync_enabled") and not project.get("todoist_project_id")
+            ),
+            "mapped_notion_projects": len(mapped_projects),
+            "unmapped_streams": sum(1 for stream in streams.values() if not stream.get("todoist_project_id")),
+            "mapped_streams": len(mapped_streams),
+            "todoist_tasks_in_unmapped_projects": sum(
+                1 for task in active_tasks if str(task.get("project_id") or "") not in mapped_projects
+            ),
+            "notion_tasks_without_todoist_id": sum(1 for task in notion_tasks if not task.get("todoist_id")),
+            "notion_tasks_with_invalid_section": invalid_sections,
+            "planned_task_moves": planned_moves,
+        }
+
+    def _save_inventory_snapshot(
+        self,
+        notion_tasks: list[dict[str, Any]],
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        todoist_projects: list[dict[str, Any]],
+        sections: list[dict[str, Any]],
+        labels: list[dict[str, Any]],
+        active_tasks: list[dict[str, Any]],
+        planned: dict[str, int],
+    ) -> Path:
+        snapshot = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "mode": self.mode,
+            "planned": planned,
+            "notion": {
+                "tasks": notion_tasks,
+                "projects": list(projects.values()),
+                "streams": list(streams.values()),
+            },
+            "todoist": {
+                "projects": todoist_projects,
+                "sections": sections,
+                "labels": labels,
+                "active_tasks": active_tasks,
+            },
+        }
+        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        return self.snapshot_path
+
+    def _ensure_todoist_project_hierarchy(
+        self,
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        todoist_projects: list[dict[str, Any]],
+        result: SyncResult,
+    ) -> None:
+        if not self.allow_project_create:
+            return
+        todoist_by_id = {str(project.get("id")): project for project in todoist_projects}
+        todoist_by_name_parent = {
+            (_normalize_title(project.get("name")), str(project.get("parent_id") or "")): project
+            for project in todoist_projects
+        }
+        stream_by_id = {stream["id"]: stream for stream in streams.values()}
+        for project in projects.values():
+            if not project.get("sync_enabled") or project.get("todoist_project_id"):
+                continue
+            stream = stream_by_id.get(str(project.get("stream_id") or ""))
+            parent_id = str((stream or {}).get("todoist_project_id") or "")
+            if stream and not parent_id:
+                existing_parent = todoist_by_name_parent.get((_normalize_title(stream["name"]), ""))
+                parent_id = str(existing_parent.get("id")) if existing_parent else str(
+                    self.todoist.create_project(stream["name"]) or ""
+                )
+                if parent_id:
+                    stream["todoist_project_id"] = parent_id
+                    self._set_notion_external_id(stream["id"], "Todoist Parent Project ID", parent_id)
+                    if parent_id not in todoist_by_id:
+                        result.sections_created += 1
+            existing = todoist_by_name_parent.get((_normalize_title(project["name"]), parent_id))
+            todoist_project_id = str(existing.get("id")) if existing else str(
+                self.todoist.create_project(project["name"], parent_id or None) or ""
+            )
+            if todoist_project_id:
+                project["todoist_project_id"] = todoist_project_id
+                self._set_notion_external_id(project["id"], "Todoist Project ID", todoist_project_id)
+                result.labels_created += 1
+
+    def _set_notion_external_id(self, page_id: str, property_name: str, value: str) -> None:
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.notion_headers,
+            payload={"properties": {property_name: _rich_text(value)}},
+        )
 
     @staticmethod
     def _attach_notion_routing(
         notion_tasks: list[dict[str, Any]],
         projects: dict[str, dict[str, str]],
         streams: dict[str, dict[str, str]],
-        inbox_project_id: str,
-        sections: dict[str, str],
+        todoist_projects: list[dict[str, Any]],
+        sections: list[dict[str, Any]],
     ) -> None:
         projects_by_id = {project["id"]: project for project in projects.values()}
         stream_names_by_id = {stream["id"]: stream["name"] for stream in streams.values()}
+        todoist_project_ids = {str(project.get("id")) for project in todoist_projects}
+        sections_by_id = {str(section.get("id")): section for section in sections}
         for task in notion_tasks:
             project = projects_by_id.get(task.get("project_id"), {})
             task["project_name"] = project.get("name", "")
-            stream_id = task.get("stream_id")
+            stream_id = project.get("stream_id") or ""
+            task["stream_id"] = stream_id
             task["stream_name"] = stream_names_by_id.get(stream_id, "")
-            task["inbox_project_id"] = inbox_project_id
-            section_name = task["stream_name"] or OTHER_SECTION_NAME
-            task["section_id"] = sections.get(_normalize_title(section_name))
+            todoist_project_id = str(project.get("todoist_project_id") or "")
+            task["todoist_project_id"] = todoist_project_id if todoist_project_id in todoist_project_ids else ""
+            section_id = str(task.get("todoist_section_id") or "")
+            section = sections_by_id.get(section_id)
+            task["todoist_section_id"] = (
+                section_id if section and str(section.get("project_id")) == task["todoist_project_id"] else ""
+            )
 
     def _find_notion_by_todoist_id(self, todoist_id: str) -> dict[str, Any] | None:
         data = request_json(
@@ -595,10 +759,21 @@ class TaskSyncService:
         task: dict[str, Any],
         projects: dict[str, dict[str, str]] | None = None,
         streams: dict[str, dict[str, str]] | None = None,
-        sections: dict[str, str] | None = None,
+        todoist_projects: list[dict[str, Any]] | None = None,
+        sections: list[dict[str, Any]] | None = None,
     ) -> None:
         properties = _notion_properties_from_todoist(task)
-        properties.update(_notion_routing_from_todoist(task, projects or {}, streams or {}, sections or {}))
+        if not self.allow_status_write:
+            properties.pop("Статус", None)
+        properties.update(
+            _notion_routing_from_todoist(
+                task,
+                projects or {},
+                streams or {},
+                todoist_projects or [],
+                sections or [],
+            )
+        )
         properties["Todoist ID"] = _rich_text(str(task["id"]))
         properties["Sync status"] = _select("Synced")
         properties["Sync error"] = _rich_text("")
@@ -616,11 +791,22 @@ class TaskSyncService:
         task: dict[str, Any],
         projects: dict[str, dict[str, str]] | None = None,
         streams: dict[str, dict[str, str]] | None = None,
-        sections: dict[str, str] | None = None,
+        todoist_projects: list[dict[str, Any]] | None = None,
+        sections: list[dict[str, Any]] | None = None,
         current_status: str | None = None,
     ) -> None:
         properties = _notion_properties_from_todoist(task, current_status=current_status)
-        properties.update(_notion_routing_from_todoist(task, projects or {}, streams or {}, sections or {}))
+        if not self.allow_status_write:
+            properties.pop("Статус", None)
+        properties.update(
+            _notion_routing_from_todoist(
+                task,
+                projects or {},
+                streams or {},
+                todoist_projects or [],
+                sections or [],
+            )
+        )
         properties["Sync status"] = _select("Synced")
         properties["Sync error"] = _rich_text("")
         request_json(
@@ -636,9 +822,10 @@ class TaskSyncService:
         task: dict[str, Any],
         projects: dict[str, dict[str, str]],
         streams: dict[str, dict[str, str]],
-        sections: dict[str, str],
+        todoist_projects: list[dict[str, Any]],
+        sections: list[dict[str, Any]],
     ) -> None:
-        properties = _notion_routing_from_todoist(task, projects, streams, sections)
+        properties = _notion_routing_from_todoist(task, projects, streams, todoist_projects, sections)
         properties["Sync status"] = _select("Synced")
         request_json(
             "PATCH",
@@ -743,6 +930,9 @@ class TaskSyncService:
             "sync_todoist_hash": _plain_rich_text(props.get("Sync Todoist hash")),
             "project_id": _plain_relation_id(props.get("Проект")),
             "stream_id": _plain_relation_id(props.get("Stream")),
+            "section_name": _plain_rich_text(props.get("Раздел")),
+            "todoist_section_id": _plain_rich_text(props.get("Todoist Section ID")),
+            "managed_labels": _plain_multi_select(props.get("Метки Todoist")),
             "last_edited_time": row.get("last_edited_time", ""),
         }
 
@@ -789,6 +979,7 @@ def _notion_properties_from_todoist(
         "Strategic Impact": _select(_priority_to_strategic(todoist_priority(task.get("priority")))),
         "Срок выполнения": _date(due.get("date")),
         "Deadline": _date(deadline.get("date")),
+        "Метки Todoist": _multi_select(_managed_labels(task.get("labels") or [])),
     }
     return properties
 
@@ -797,12 +988,21 @@ def _notion_routing_from_todoist(
     task: dict[str, Any],
     projects: dict[str, dict[str, str]],
     streams: dict[str, dict[str, str]],
-    sections: dict[str, str],
+    todoist_projects: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    project_id, stream_id = _routing_ids_from_todoist(task, projects, streams, sections)
+    project_id, stream_id, section_name, section_id = _routing_ids_from_todoist(
+        task,
+        projects,
+        streams,
+        todoist_projects,
+        sections,
+    )
     return {
         "Проект": _relation(project_id) if project_id else {"relation": []},
         "Stream": _relation(stream_id) if stream_id else {"relation": []},
+        "Раздел": _rich_text(section_name),
+        "Todoist Section ID": _rich_text(section_id),
     }
 
 
@@ -810,16 +1010,36 @@ def _routing_ids_from_todoist(
     task: dict[str, Any],
     projects: dict[str, dict[str, str]],
     streams: dict[str, dict[str, str]],
-    sections: dict[str, str],
-) -> tuple[str | None, str | None]:
-    labels = [_normalize_title(label) for label in task.get("labels") or []]
-    project = next((projects[label] for label in labels if label in projects), None)
+    todoist_projects: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+) -> tuple[str | None, str | None, str, str]:
+    todoist_project_ids = {str(item.get("id")) for item in todoist_projects}
+    todoist_project_id = str(task.get("project_id") or "")
+    project = next(
+        (
+            item
+            for item in projects.values()
+            if str(item.get("todoist_project_id") or "") == todoist_project_id
+            and todoist_project_id in todoist_project_ids
+        ),
+        None,
+    )
+    stream_id = str((project or {}).get("stream_id") or "")
     section_id = str(task.get("section_id") or "")
-    section_name = next((name for name, item_id in sections.items() if str(item_id) == section_id), "")
-    stream = streams.get(section_name)
-    if not stream and project and project.get("stream_id"):
-        stream = next((item for item in streams.values() if item["id"] == project["stream_id"]), None)
-    return (project["id"] if project else None, stream["id"] if stream else None)
+    section = next(
+        (
+            item
+            for item in sections
+            if str(item.get("id")) == section_id and str(item.get("project_id")) == todoist_project_id
+        ),
+        None,
+    )
+    return (
+        project["id"] if project else None,
+        stream_id or None,
+        str((section or {}).get("name") or ""),
+        section_id if section else "",
+    )
 
 
 def _todoist_routing_differs(
@@ -827,12 +1047,17 @@ def _todoist_routing_differs(
     todoist_task: dict[str, Any],
     projects: dict[str, dict[str, str]],
     streams: dict[str, dict[str, str]],
-    sections: dict[str, str],
+    todoist_projects: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
 ) -> bool:
-    project_id, stream_id = _routing_ids_from_todoist(todoist_task, projects, streams, sections)
+    project_id, stream_id, section_name, section_id = _routing_ids_from_todoist(
+        todoist_task, projects, streams, todoist_projects, sections
+    )
     return (notion_task.get("project_id") or "") != (project_id or "") or (
         notion_task.get("stream_id") or ""
-    ) != (stream_id or "")
+    ) != (stream_id or "") or (notion_task.get("section_name") or "") != section_name or (
+        notion_task.get("todoist_section_id") or ""
+    ) != section_id
 
 
 def _project_stream_section(
@@ -841,16 +1066,9 @@ def _project_stream_section(
     streams: dict[str, dict[str, str]],
     sections: dict[str, str],
 ) -> str | None:
-    current_section_id = str(task.get("section_id") or "")
-    current_section_name = next((name for name, item_id in sections.items() if str(item_id) == current_section_id), "")
-    if current_section_name in streams:
-        return None
-    labels = [_normalize_title(label) for label in task.get("labels") or []]
-    project = next((projects[label] for label in labels if label in projects), None)
-    if not project or not project.get("stream_id"):
-        return None
-    stream = next((item for item in streams.values() if item["id"] == project["stream_id"]), None)
-    return sections.get(_normalize_title(stream["name"])) if stream else None
+    # Kept as a compatibility shim for callers from older deployments.
+    # New routing never moves a task based on a project label or stream section.
+    return None
 
 
 def _title(value: str) -> dict[str, Any]:
@@ -865,6 +1083,10 @@ def _rich_text(value: str) -> dict[str, Any]:
 
 def _select(value: str | None) -> dict[str, Any]:
     return {"select": {"name": value}} if value else {"select": None}
+
+
+def _multi_select(values: list[str]) -> dict[str, Any]:
+    return {"multi_select": [{"name": value} for value in values]}
 
 
 def _status(value: str) -> dict[str, Any]:
@@ -890,6 +1112,14 @@ def _plain_rich_text(prop: dict[str, Any] | None) -> str:
 def _plain_select(prop: dict[str, Any] | None) -> str:
     value = (prop or {}).get("select") or (prop or {}).get("status")
     return value.get("name", "") if value else ""
+
+
+def _plain_multi_select(prop: dict[str, Any] | None) -> list[str]:
+    return [str(item.get("name") or "") for item in (prop or {}).get("multi_select", []) if item.get("name")]
+
+
+def _plain_checkbox(prop: dict[str, Any] | None) -> bool:
+    return bool((prop or {}).get("checkbox"))
 
 
 def _plain_date(prop: dict[str, Any] | None) -> str | None:
@@ -949,11 +1179,14 @@ def _apply_todoist_snapshot_to_notion(
     todoist_task: dict[str, Any],
     projects: dict[str, dict[str, str]],
     streams: dict[str, dict[str, str]],
-    sections: dict[str, str],
+    todoist_projects: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
 ) -> None:
     due = todoist_task.get("due") or {}
     deadline = todoist_task.get("deadline") or {}
-    project_id, stream_id = _routing_ids_from_todoist(todoist_task, projects, streams, sections)
+    project_id, stream_id, section_name, section_id = _routing_ids_from_todoist(
+        todoist_task, projects, streams, todoist_projects, sections
+    )
     notion_task.update(
         {
             "title": str(todoist_task.get("content") or "Без названия"),
@@ -964,6 +1197,9 @@ def _apply_todoist_snapshot_to_notion(
             "deadline": deadline.get("date"),
             "project_id": project_id,
             "stream_id": stream_id,
+            "section_name": section_name,
+            "todoist_section_id": section_id,
+            "managed_labels": _managed_labels(todoist_task.get("labels") or []),
             "project_name": next(
                 (project["name"] for project in projects.values() if project["id"] == project_id),
                 "",
@@ -991,10 +1227,12 @@ def _apply_notion_snapshot_to_todoist(todoist_task: dict[str, Any], notion_task:
 
 
 def _apply_notion_routing_snapshot_to_todoist(todoist_task: dict[str, Any], notion_task: dict[str, Any]) -> None:
-    todoist_task["labels"] = [notion_task["project_name"]] if notion_task.get("project_name") else []
-    if notion_task.get("inbox_project_id"):
-        todoist_task["project_id"] = notion_task["inbox_project_id"]
-        todoist_task["section_id"] = notion_task.get("section_id")
+    existing = list(todoist_task.get("labels") or [])
+    unmanaged = [label for label in existing if not _is_managed_label(label)]
+    todoist_task["labels"] = sorted(set([*unmanaged, *notion_task.get("managed_labels", [])]))
+    if notion_task.get("todoist_project_id"):
+        todoist_task["project_id"] = notion_task["todoist_project_id"]
+        todoist_task["section_id"] = notion_task.get("todoist_section_id")
 
 
 def _parse_time(value: str | None) -> datetime:
@@ -1028,6 +1266,9 @@ def _fingerprint(value: dict[str, Any]) -> str:
             "todoist_id": value.get("todoist_id"),
             "project_name": value.get("project_name"),
             "stream_name": value.get("stream_name"),
+            "section_name": value.get("section_name"),
+            "todoist_section_id": value.get("todoist_section_id"),
+            "managed_labels": value.get("managed_labels"),
         }
     else:
         relevant = {
@@ -1056,3 +1297,17 @@ def _match_key_todoist(task: dict[str, Any]) -> tuple[str, str]:
 
 def _normalize_title(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
+
+
+def _managed_labels(labels: list[Any]) -> list[str]:
+    return sorted(
+        {
+            _normalize_title(label).removeprefix("@")
+            for label in labels
+            if _is_managed_label(label)
+        }
+    )
+
+
+def _is_managed_label(label: Any) -> bool:
+    return _normalize_title(label).removeprefix("@") in MANAGED_TODOIST_LABELS
