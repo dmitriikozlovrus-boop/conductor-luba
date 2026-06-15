@@ -34,6 +34,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/ops/bootstrap-projects-20260614-cddd4d5":
+            self._json(200, {"ok": True, **service.task_sync.bootstrap_projects()})
+            return
         if self.path == "/tasks/sync":
             self._handle_manual_sync()
             return

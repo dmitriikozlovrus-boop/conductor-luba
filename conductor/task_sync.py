@@ -240,6 +240,28 @@ class TaskSyncService:
         finally:
             self._lock.release()
 
+    def bootstrap_projects(self) -> dict[str, Any]:
+        result = SyncResult(errors=[], mode="projects")
+        if not self.enabled:
+            result.errors.append("Todoist sync is not configured")
+            return result.as_dict()
+        if not self._lock.acquire(blocking=False):
+            result.errors.append("Todoist sync is already running")
+            return result.as_dict()
+        try:
+            streams = self._list_notion_streams()
+            projects = self._list_notion_projects()
+            todoist_projects = self.todoist.list_projects()
+            previous = self.allow_project_create
+            self.allow_project_create = True
+            try:
+                self._ensure_todoist_project_hierarchy(projects, streams, todoist_projects, result)
+            finally:
+                self.allow_project_create = previous
+            return result.as_dict()
+        finally:
+            self._lock.release()
+
     def _link_existing_matches(
         self,
         notion_tasks: list[dict[str, Any]],
