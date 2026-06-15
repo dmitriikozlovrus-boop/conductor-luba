@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -32,12 +33,22 @@ def request_json(
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req_headers.setdefault("Content-Type", "application/json")
-    req = request.Request(url, data=body, method=method, headers=req_headers)
-    try:
-        with request.urlopen(req, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        raise HttpError(exc.code, exc.read().decode("utf-8", errors="replace")) from exc
+    raw = ""
+    for attempt in range(5):
+        req = request.Request(url, data=body, method=method, headers=req_headers)
+        try:
+            with request.urlopen(req, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+            break
+        except error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            if exc.code != 429 or attempt == 4:
+                raise HttpError(exc.code, response_body) from exc
+            try:
+                retry_after = float(exc.headers.get("Retry-After") or 1)
+            except (TypeError, ValueError):
+                retry_after = 1
+            time.sleep(max(retry_after, 0.1))
     if not raw:
         return {}
     return json.loads(raw)
