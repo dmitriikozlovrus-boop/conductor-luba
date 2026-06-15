@@ -33,9 +33,9 @@ services:
       - key: TODOIST_SYNC_PAUSED
         value: false
       - key: TODOIST_SYNC_MODE
-        value: observe
+        value: projects
       - key: TODOIST_ALLOW_PROJECT_CREATE
-        value: false
+        value: true
       - key: TODOIST_ALLOW_TASK_CREATE
         value: false
       - key: TODOIST_ALLOW_TASK_MOVE

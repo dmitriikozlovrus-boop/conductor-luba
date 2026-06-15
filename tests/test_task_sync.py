@@ -157,6 +157,11 @@ class SafetyTest(unittest.TestCase):
         result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
         self.assertEqual(result["reason"], "sync is in observe mode")
 
+    def test_projects_mode_webhook_is_ignored(self):
+        sync = service(mode="projects")
+        result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
+        self.assertEqual(result["reason"], "sync is in projects mode")
+
     def test_missing_task_is_not_cancelled_by_default(self):
         sync = service(mode="write")
         sync._update_notion_status = Mock()
@@ -239,7 +244,7 @@ class SafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "move limit"):
             sync._enforce_todoist_routing(notion, {"labels": [], "project_id": "tp-1", "is_completed": False})
 
-    def test_project_hierarchy_creation_requires_opt_in(self):
+    def test_project_hierarchy_creation_is_isolated_behind_project_write_flag(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True
         todoist.api_token = "token"
@@ -266,15 +271,17 @@ class SafetyTest(unittest.TestCase):
         self.assertEqual(todoist.create_project.call_args_list[0].args, ("Business",))
         self.assertEqual(todoist.create_project.call_args_list[1].args, ("Project A", "stream-todo"))
 
-    def test_project_without_sync_checkbox_is_not_created(self):
-        sync = service(mode="write", allow_project_create=True)
+    def test_project_without_sync_checkbox_is_created_when_project_writes_are_enabled(self):
+        sync = service(mode="projects", allow_project_create=True)
+        sync._set_notion_external_id = Mock()
+        sync.todoist.create_project.return_value = "todo-project"
         sync._ensure_todoist_project_hierarchy(
             {"a": {"id": "p", "name": "A", "stream_id": "", "todoist_project_id": "", "sync_enabled": False}},
             {},
             [],
             SyncResult(errors=[]),
         )
-        sync.todoist.create_project.assert_not_called()
+        sync.todoist.create_project.assert_called_once_with("A", None)
 
     def test_rate_limit_retry_after_is_honored(self):
         self.assertEqual(_retry_after(HttpError(429, '{"error_extra":{"retry_after":1280}}')), 1280)

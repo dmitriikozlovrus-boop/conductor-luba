@@ -86,7 +86,7 @@ class TaskSyncService:
         self.completed_since = completed_since
         self.streams_database_id = streams_database_id
         self.paused = paused
-        self.mode = mode if mode in {"observe", "write"} else "observe"
+        self.mode = mode if mode in {"observe", "projects", "write"} else "observe"
         self.allow_project_create = allow_project_create
         self.allow_task_create = allow_task_create
         self.allow_task_move = allow_task_move
@@ -177,6 +177,8 @@ class TaskSyncService:
                 return result.as_dict()
 
             self._ensure_todoist_project_hierarchy(projects, streams, todoist_projects, result)
+            if self.mode == "projects":
+                return result.as_dict()
             todoist_projects = self.todoist.list_projects()
             self._attach_notion_routing(notion_tasks, projects, streams, todoist_projects, sections)
             meta = state.get("__meta__", {})
@@ -264,8 +266,8 @@ class TaskSyncService:
     def handle_todoist_event(self, event: dict[str, Any]) -> dict[str, Any]:
         if not self.enabled:
             return {"ignored": True, "reason": "sync disabled"}
-        if self.mode == "observe":
-            return {"ignored": True, "reason": "sync is in observe mode"}
+        if self.mode != "write":
+            return {"ignored": True, "reason": f"sync is in {self.mode} mode"}
         # Webhooks and periodic reconciliation share the same state file.
         # Serialize them so a webhook cannot be overwritten by an older sync snapshot.
         with self._lock:
@@ -637,7 +639,7 @@ class TaskSyncService:
             "projects_eligible_for_creation": sum(
                 1
                 for project in projects.values()
-                if project.get("sync_enabled") and not project.get("todoist_project_id")
+                if not project.get("todoist_project_id")
             ),
             "mapped_notion_projects": len(mapped_projects),
             "unmapped_streams": sum(1 for stream in streams.values() if not stream.get("todoist_project_id")),
@@ -782,7 +784,7 @@ class TaskSyncService:
         }
         stream_by_id = {stream["id"]: stream for stream in streams.values()}
         for project in projects.values():
-            if not project.get("sync_enabled") or project.get("todoist_project_id"):
+            if project.get("todoist_project_id"):
                 continue
             stream = stream_by_id.get(str(project.get("stream_id") or ""))
             parent_id = str((stream or {}).get("todoist_project_id") or "")
