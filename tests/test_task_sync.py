@@ -220,11 +220,12 @@ class SafetyTest(unittest.TestCase):
                 {"id": "unmatched", "project_id": "inbox", "labels": ["звонок"]},
                 {"id": "already-moved", "project_id": "tp-a", "labels": ["Project B"]},
             ]
+            sync.todoist.update_task_locations_batch.return_value = {}
             result = sync.move_labeled_inbox_tasks()
         self.assertEqual(result["moved"], 1)
         self.assertEqual(result["ambiguous"], 1)
         self.assertEqual(result["left_without_project_label"], 1)
-        sync.todoist.update_task_location.assert_called_once_with("move", "tp-a", None)
+        sync.todoist.update_task_locations_batch.assert_called_once_with([("move", "tp-a")])
         self.assertEqual(sync.mode, "todoist-primary")
 
     def test_missing_task_is_not_cancelled_by_default(self):
@@ -353,6 +354,16 @@ class SafetyTest(unittest.TestCase):
 
 
 class TodoistClientTest(unittest.TestCase):
+    def test_batch_location_update_only_sends_move_commands(self):
+        client = TodoistClient("token", True)
+        with patch("conductor.todoist_client.request_json") as request:
+            request.return_value = {"sync_status": {"command-1": "ok"}}
+            with patch("conductor.todoist_client.uuid4", return_value="command-1"):
+                failures = client.update_task_locations_batch([("task-1", "project-1")])
+        commands = request.call_args.kwargs["payload"]["commands"]
+        self.assertEqual(commands, [{"type": "item_move", "uuid": "command-1", "args": {"id": "task-1", "project_id": "project-1"}}])
+        self.assertEqual(failures, {})
+
     def test_move_to_section_does_not_also_send_project(self):
         client = TodoistClient("token", True)
         with patch("conductor.todoist_client.request_json") as request:

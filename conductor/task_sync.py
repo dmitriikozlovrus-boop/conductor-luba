@@ -1072,16 +1072,14 @@ class TaskSyncService:
                 else:
                     without_project_label += 1
 
-            errors: list[str] = []
             moved_by_project: dict[str, int] = {}
+            failures = self.todoist.update_task_locations_batch(moves) if moves else {}
             for task_id, project_id in moves:
-                try:
-                    self.todoist.update_task_location(task_id, project_id, None)
-                    moved_by_project[project_names.get(project_id, project_id)] = (
-                        moved_by_project.get(project_names.get(project_id, project_id), 0) + 1
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{task_id}: {exc}")
+                if task_id in failures:
+                    continue
+                project_name = project_names.get(project_id, project_id)
+                moved_by_project[project_name] = moved_by_project.get(project_name, 0) + 1
+            errors = [f"{task_id}: {error}" for task_id, error in failures.items()]
             return {
                 "moved": len(moves) - len(errors),
                 "ambiguous": ambiguous,

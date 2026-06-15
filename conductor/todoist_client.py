@@ -120,6 +120,35 @@ class TodoistClient:
         if status != "ok":
             raise RuntimeError(f"Todoist could not move task {task_id}: {status}")
 
+    def update_task_locations_batch(self, moves: list[tuple[str, str]]) -> dict[str, str]:
+        commands: list[dict[str, Any]] = []
+        command_tasks: dict[str, str] = {}
+        for task_id, project_id in moves:
+            command_uuid = str(uuid4())
+            command_tasks[command_uuid] = task_id
+            commands.append(
+                {
+                    "type": "item_move",
+                    "uuid": command_uuid,
+                    "args": {"id": task_id, "project_id": project_id},
+                }
+            )
+        failures: dict[str, str] = {}
+        for start in range(0, len(commands), 100):
+            batch = commands[start : start + 100]
+            response = request_json(
+                "POST",
+                f"{API_BASE}/sync",
+                headers=self.headers,
+                payload={"commands": batch},
+            )
+            statuses = response.get("sync_status") or {}
+            for command in batch:
+                status = statuses.get(command["uuid"])
+                if status != "ok":
+                    failures[command_tasks[command["uuid"]]] = str(status)
+        return failures
+
     def update_task_routing_batch(self, changes: list[dict[str, Any]]) -> None:
         commands: list[dict[str, Any]] = []
         for change in changes:
