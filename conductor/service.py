@@ -42,7 +42,10 @@ class ConductorService:
             settings.todoist_completed_since,
             settings.notion_streams_database_id,
             paused=settings.todoist_sync_paused,
-            mode=settings.todoist_sync_mode,
+            # The legacy production value is still "observe" in Render.
+            # Migrate it to the webhook-only Todoist-primary mode; all bulk
+            # Todoist write flags remain disabled.
+            mode="todoist-primary" if settings.todoist_sync_mode == "observe" else settings.todoist_sync_mode,
             allow_project_create=settings.todoist_allow_project_create,
             allow_task_create=settings.todoist_allow_task_create,
             allow_task_move=settings.todoist_allow_task_move,
