@@ -142,11 +142,14 @@ class SafetyTest(unittest.TestCase):
             result = sync.sync()
             snapshot = json.loads(Path(result["snapshot_path"]).read_text(encoding="utf-8"))
             report = sync.read_inventory_report()
+            summary = sync.read_inventory_summary()
         self.assertEqual(result["mode"], "observe")
         self.assertEqual(snapshot["todoist"]["active_tasks"][0]["id"], "t-1")
         self.assertTrue(report["available"])
         self.assertEqual(report["todoist_projects"][0]["active_task_count"], 1)
         self.assertNotIn("t-1", json.dumps(report))
+        self.assertEqual(summary["inventory"]["todoist_active_tasks"], 1)
+        self.assertNotIn("todoist_projects", summary)
         todoist.create_project.assert_not_called()
         todoist.create_task.assert_not_called()
         todoist.update_task_location.assert_not_called()
@@ -161,16 +164,6 @@ class SafetyTest(unittest.TestCase):
         sync = service(mode="projects")
         result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
         self.assertEqual(result["reason"], "sync is in projects mode")
-
-    def test_bootstrap_projects_does_not_enter_task_sync(self):
-        sync = service(mode="observe")
-        sync._list_notion_streams = Mock(return_value={})
-        sync._list_notion_projects = Mock(return_value={})
-        sync.todoist.list_projects.return_value = []
-        sync._ensure_todoist_project_hierarchy = Mock()
-        result = sync.bootstrap_projects()
-        self.assertEqual(result["mode"], "projects")
-        sync._ensure_todoist_project_hierarchy.assert_called_once()
 
     def test_missing_task_is_not_cancelled_by_default(self):
         sync = service(mode="write")

@@ -240,28 +240,6 @@ class TaskSyncService:
         finally:
             self._lock.release()
 
-    def bootstrap_projects(self) -> dict[str, Any]:
-        result = SyncResult(errors=[], mode="projects")
-        if not self.enabled:
-            result.errors.append("Todoist sync is not configured")
-            return result.as_dict()
-        if not self._lock.acquire(blocking=False):
-            result.errors.append("Todoist sync is already running")
-            return result.as_dict()
-        try:
-            streams = self._list_notion_streams()
-            projects = self._list_notion_projects()
-            todoist_projects = self.todoist.list_projects()
-            previous = self.allow_project_create
-            self.allow_project_create = True
-            try:
-                self._ensure_todoist_project_hierarchy(projects, streams, todoist_projects, result)
-            finally:
-                self.allow_project_create = previous
-            return result.as_dict()
-        finally:
-            self._lock.release()
-
     def _link_existing_matches(
         self,
         notion_tasks: list[dict[str, Any]],
@@ -789,6 +767,18 @@ class TaskSyncService:
             return {"available": False}
         report = json.loads(self.report_path.read_text(encoding="utf-8"))
         return {"available": True, **report}
+
+    def read_inventory_summary(self) -> dict[str, Any]:
+        report = self.read_inventory_report()
+        if not report.get("available"):
+            return {"available": False}
+        return {
+            "available": True,
+            "created_at": report.get("created_at", ""),
+            "mode": report.get("mode", ""),
+            "inventory": report.get("inventory", {}),
+            "planned": report.get("planned", {}),
+        }
 
     def _ensure_todoist_project_hierarchy(
         self,
