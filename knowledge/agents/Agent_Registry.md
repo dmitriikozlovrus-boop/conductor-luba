@@ -122,8 +122,8 @@ User Interface Agent
 
 - `docs/architecture/System_Map.md`;
 - `docs/architecture/System_Component_Registry.md`;
-- `docs/conductor/Conductor_Service_Description.md`;
-- `docs/use_cases/`.
+- `docs/services/conductor/Conductor_Service_Description.md`;
+- `docs/product/use_cases/`.
 
 ---
 
@@ -177,9 +177,9 @@ Orchestration Service
 
 - `docs/architecture/System_Map.md`;
 - `docs/architecture/System_Component_Registry.md`;
-- `docs/conductor/Conductor_Service_Description.md`;
+- `docs/services/conductor/Conductor_Service_Description.md`;
 - `docs/data/Data_Ownership_Map.md`;
-- `docs/use_cases/`;
+- `docs/product/use_cases/`;
 - `docs/architecture/Document_Placement_Rules.md`.
 
 ---
@@ -227,7 +227,7 @@ Intelligence Agent
 
 - `docs/architecture/System_Map.md`;
 - `docs/architecture/System_Component_Registry.md`;
-- `docs/use_cases/`;
+- `docs/product/use_cases/`;
 - `docs/data/Data_Ownership_Map.md`.
 
 Комментарий:  
@@ -281,8 +281,8 @@ Intelligence Agent / Execution Agent
 - `docs/architecture/System_Map.md`;
 - `docs/architecture/System_Component_Registry.md`;
 - `docs/data/Data_Ownership_Map.md`;
-- `docs/use_cases/`;
-- будущий `docs/use_cases/Tasks_Todoist_Sync.md`.
+- `docs/product/use_cases/`;
+- будущий `docs/product/use_cases/Tasks_Todoist_Sync.md`.
 
 Комментарий:  
 Для use case `Tasks DB ↔ Todoist Sync` основной фокус должен быть на `Task Logic`, `Todoist Integration`, `Sync Rules`, `Conflict Rules` и `Data Ownership`, а не на реализации `Task Agent`.
@@ -335,7 +335,7 @@ Intelligence Agent / Execution Agent
 - `docs/architecture/System_Map.md`;
 - `docs/architecture/System_Component_Registry.md`;
 - `docs/data/Data_Ownership_Map.md`;
-- `docs/use_cases/`.
+- `docs/product/use_cases/`.
 
 Комментарий:  
 Calendar integration, calendar logic и Calendar Agent — разные вещи.
@@ -366,7 +366,7 @@ Calendar Agent = Intelligence Agent
 
 Причина: эти роли пока не являются стабильными и не нужны для первых use cases.
 
-Если такие роли понадобятся, они должны добавляться после появления устойчивого сценария и отдельного описания в `docs/use_cases/` или `docs/roadmap/`.
+Если такие роли понадобятся, они должны добавляться после появления устойчивого сценария и отдельного описания в `docs/product/use_cases/` или `docs/roadmap/`.
 
 ## Правила ведения Agent Registry
 
@@ -379,7 +379,7 @@ Calendar Agent = Intelligence Agent
 7. `Conductor` не должен превращаться в универсального исполнителя всех функций.
 8. `Lyuba` не должна подменять `Conductor`.
 9. Подробные планы будущих агентов должны храниться в `docs/roadmap/`.
-10. Конкретные сценарии работы агентов должны описываться в `docs/use_cases/`.
+10. Конкретные сценарии работы агентов должны описываться в `docs/product/use_cases/`.
 
 ## Связанные документы
 
@@ -388,9 +388,9 @@ Calendar Agent = Intelligence Agent
 | `docs/architecture/System_Map.md` | верхнеуровневая логическая карта системы |
 | `docs/architecture/System_Component_Registry.md` | перечень компонентов по слоям |
 | `docs/architecture/Document_Placement_Rules.md` | правила размещения документов |
-| `docs/conductor/Conductor_Service_Description.md` | описание Conductor |
+| `docs/services/conductor/Conductor_Service_Description.md` | описание Conductor |
 | `docs/data/Data_Ownership_Map.md` | источники истины и владение данными |
-| `docs/use_cases/` | конкретные сценарии обработки |
+| `docs/product/use_cases/` | конкретные сценарии обработки |
 | `docs/roadmap/` | будущие роли и планы развития |
 
 ## Текущий статус
